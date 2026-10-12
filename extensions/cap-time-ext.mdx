@@ -1,0 +1,154 @@
+---
+title: "cap-time-ext: Extended Clock Traits"
+sidebarTitle: "cap-time-ext"
+description: "Extension traits for cap-std's SystemClock and MonotonicClock, adding precision hints, clock resolution queries, and timezone access."
+---
+
+The `cap-time-ext` crate adds extension traits to `cap-std`'s clock types, providing precision-hint variants of the standard `now()` call, clock resolution queries, and a capability-wrapped timezone accessor — all while keeping clock access behind explicit capability values rather than ambient global state.
+
+## Installation
+
+```toml
+[dependencies]
+cap-time-ext = "4.0.3"
+```
+
+---
+
+## Traits
+
+### `SystemClockExt`
+
+Extends `cap_std::time::SystemClock` (backed by `cap_primitives::time::SystemClock`) with two methods: `now_with`, which accepts a precision hint, and `resolution`, which returns the clock's actual resolution.
+
+```rust
+pub trait SystemClockExt {
+    type SystemTime;
+
+    fn now_with(&self, precision: Duration) -> Self::SystemTime;
+    fn resolution(&self) -> Duration;
+}
+```
+
+| Method | Description |
+|---|---|
+| `now_with(precision)` | Returns the current wall-clock time. The `precision` argument is a **hint** — the implementation may return a time with greater precision than requested. On platforms without a fast low-precision clock this is equivalent to `SystemClock::now()`. |
+| `resolution()` | Returns the actual resolution of the system clock. On most POSIX systems this is `clock_getres(CLOCK_REALTIME)`. On Windows, returns a conservative 55 ms (based on the Windows system timer documentation). |
+
+### `MonotonicClockExt`
+
+Extends `cap_std::time::MonotonicClock` with the same interface.
+
+```rust
+pub trait MonotonicClockExt {
+    type Instant;
+
+    fn now_with(&self, precision: Duration) -> Self::Instant;
+    fn resolution(&self) -> Duration;
+}
+```
+
+Both `now_with` and `resolution` behave identically to the system-clock versions, but operate on the monotonic clock and return `Instant` values instead of `SystemTime` values.
+
+---
+
+## Type: `Timezone`
+
+`Timezone` is a capability value that wraps access to the local timezone name. Constructing it requires `AmbientAuthority`, making timezone access explicit rather than an invisible global operation.
+
+```rust
+pub struct Timezone(/* private */);
+pub struct TimezoneError(String);
+
+impl Timezone {
+    pub const fn new(ambient_authority: AmbientAuthority) -> Self;
+    pub fn timezone_name(&self) -> Result<String, TimezoneError>;
+}
+```
+
+`timezone_name` returns an IANA timezone name string such as `"America/New_York"` or `"Europe/London"`, obtained via the [`iana-time-zone`](https://crates.io/crates/iana-time-zone) crate.
+
+---
+
+## Examples
+
+### Reading clock resolution
+
+```rust
+use cap_time_ext::{MonotonicClockExt, SystemClockExt};
+use cap_std::{ambient_authority, time::{MonotonicClock, SystemClock}};
+
+let ambient = ambient_authority();
+let sys_clock = SystemClock::new(ambient);
+let mono_clock = MonotonicClock::new(ambient);
+
+println!("system clock resolution: {:?}", sys_clock.resolution());
+println!("monotonic clock resolution: {:?}", mono_clock.resolution());
+```
+
+### Using `now_with` for a coarse timestamp
+
+```rust
+use cap_time_ext::SystemClockExt;
+use cap_std::{ambient_authority, time::SystemClock};
+use std::time::Duration;
+
+let clock = SystemClock::new(ambient_authority());
+
+// Request second-level precision (implementation may give more)
+let now = clock.now_with(Duration::from_secs(1));
+println!("coarse wall time: {now:?}");
+```
+
+### Using `now_with` on the monotonic clock
+
+```rust
+use cap_time_ext::MonotonicClockExt;
+use cap_std::{ambient_authority, time::MonotonicClock};
+use std::time::Duration;
+
+let clock = MonotonicClock::new(ambient_authority());
+
+let start = clock.now_with(Duration::from_millis(1));
+// ... do work ...
+let end = clock.now_with(Duration::from_millis(1));
+
+println!("elapsed: {:?}", end.duration_since(start));
+```
+
+### Querying the local timezone
+
+```rust
+use cap_time_ext::Timezone;
+use cap_std::ambient_authority;
+
+let tz = Timezone::new(ambient_authority());
+
+match tz.timezone_name() {
+    Ok(name) => println!("local timezone: {name}"),
+    Err(e)   => eprintln!("could not determine timezone: {e}"),
+}
+```
+
+### Structuring clock access as a capability
+
+A common pattern with `cap-std` is to receive capability values as function parameters rather than reading global state. `cap-time-ext` fits naturally into that pattern:
+
+```rust
+use cap_time_ext::SystemClockExt;
+use cap_std::time::SystemClock;
+use std::time::Duration;
+
+/// Log the current time using only the passed-in clock capability.
+/// This function has no ambient access to the system time.
+fn log_event(clock: &SystemClock, message: &str) {
+    let ts = clock.now_with(Duration::from_millis(1));
+    println!("[{ts:?}] {message}");
+}
+```
+
+<Tip>
+  When you only need a coarse timestamp (e.g., for log rotation once per
+  minute), passing `Duration::from_secs(60)` as the precision hint allows the
+  OS to use a faster, lower-precision clock path on platforms that support it.
+</Tip>

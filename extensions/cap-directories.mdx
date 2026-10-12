@@ -1,0 +1,208 @@
+---
+title: "cap-directories: Standard App Directory Access"
+sidebarTitle: "cap-directories"
+description: "Capability-based access to platform-standard config, cache, data, and user directories — returning Dir handles instead of PathBufs."
+---
+
+The `cap-directories` crate provides capability-based access to the platform-standard directories used by applications (config, cache, data, runtime) and users (home, documents, downloads, etc.). It wraps the [`directories`](https://crates.io/crates/directories) crate, but instead of returning `PathBuf`s it opens the directories and returns `cap_std::fs::Dir` handles — keeping all subsequent file operations inside the capability model.
+
+## Installation
+
+```toml
+[dependencies]
+cap-directories = "4.0.3"
+```
+
+---
+
+## Why `Dir` instead of `PathBuf`?
+
+Returning a `PathBuf` from a "get my config directory" call gives you an absolute path, which can then be used to open arbitrary files anywhere on the filesystem. Returning a `Dir` instead confines subsequent operations to that specific directory and its children, preventing path-traversal bugs and making authority flow explicit in your code.
+
+<Note>
+  Both `ProjectDirs::from` and the `UserDirs::*_dir` methods require an
+  `AmbientAuthority` token. This makes the ambient filesystem access explicit at
+  the call site and easy to audit.
+</Note>
+
+---
+
+## `ProjectDirs`
+
+`ProjectDirs` computes the standard directories for a specific application, derived from the operating system's conventions and the application's qualifier, organization, and name.
+
+```rust
+pub struct ProjectDirs { /* private */ }
+
+impl ProjectDirs {
+    pub fn from(
+        qualifier: &str,
+        organization: &str,
+        application: &str,
+        ambient_authority: AmbientAuthority,
+    ) -> Option<Self>;
+
+    pub fn cache_dir(&self)      -> io::Result<Dir>;
+    pub fn config_dir(&self)     -> io::Result<Dir>;
+    pub fn data_dir(&self)       -> io::Result<Dir>;
+    pub fn data_local_dir(&self) -> io::Result<Dir>;
+    pub fn runtime_dir(&self)    -> io::Result<Dir>;
+    pub fn state_dir(&self)      -> io::Result<Option<Dir>>;
+}
+```
+
+`ProjectDirs::from` returns `None` if the home directory cannot be determined. All `*_dir` methods **create the directory if it does not exist** before opening and returning a `Dir`.
+
+### Directory locations by platform
+
+| Method | Linux (XDG) | macOS | Windows |
+|---|---|---|---|
+| `config_dir` | `$XDG_CONFIG_HOME/<app>` | `~/Library/Application Support/<app>` | `%APPDATA%\<org>\<app>` |
+| `data_dir` | `$XDG_DATA_HOME/<app>` | `~/Library/Application Support/<app>` | `%APPDATA%\<org>\<app>` |
+| `data_local_dir` | `$XDG_DATA_HOME/<app>` | `~/Library/Application Support/<app>` | `%LOCALAPPDATA%\<org>\<app>` |
+| `cache_dir` | `$XDG_CACHE_HOME/<app>` | `~/Library/Caches/<app>` | `%LOCALAPPDATA%\<org>\<app>\cache` |
+| `runtime_dir` | `$XDG_RUNTIME_DIR/<app>` | *(not available)* | *(not available)* |
+| `state_dir` | `$XDG_STATE_HOME/<app>` | *(not available)* | *(not available)* |
+
+### Example
+
+```rust
+use cap_directories::ProjectDirs;
+use cap_std::ambient_authority;
+
+fn main() -> std::io::Result<()> {
+    // qualifier, organization, application
+    let proj = ProjectDirs::from("com", "ExampleCorp", "MyApp", ambient_authority())
+        .ok_or_else(|| std::io::Error::other("no home directory"))?;
+
+    // Opens (and creates if needed) the config directory, returns a Dir
+    let config = proj.config_dir()?;
+    if config.try_exists("settings.toml")? {
+        let contents = config.read_to_string("settings.toml")?;
+        println!("settings: {contents}");
+    }
+
+    // Opens (and creates if needed) the cache directory
+    let cache = proj.cache_dir()?;
+    cache.write("last_run.txt", b"2024-01-01")?;
+
+    Ok(())
+}
+```
+
+---
+
+## `UserDirs`
+
+`UserDirs` provides paths to the standard user-facing directories (home, documents, downloads, pictures, etc.) following the operating system's conventions.
+
+```rust
+pub struct UserDirs { /* private */ }
+
+impl UserDirs {
+    pub fn new() -> Option<Self>;
+
+    pub fn home_dir(&self, ambient_authority: AmbientAuthority)     -> io::Result<Dir>;
+    pub fn audio_dir(&self, ambient_authority: AmbientAuthority)    -> io::Result<Dir>;
+    pub fn desktop_dir(&self, ambient_authority: AmbientAuthority)  -> io::Result<Dir>;
+    pub fn document_dir(&self, ambient_authority: AmbientAuthority) -> io::Result<Dir>;
+    pub fn download_dir(&self, ambient_authority: AmbientAuthority) -> io::Result<Dir>;
+    pub fn font_dir(&self, ambient_authority: AmbientAuthority)     -> io::Result<Dir>;
+    pub fn picture_dir(&self, ambient_authority: AmbientAuthority)  -> io::Result<Dir>;
+    pub fn public_dir(&self, ambient_authority: AmbientAuthority)   -> io::Result<Dir>;
+    pub fn template_dir(&self, ambient_authority: AmbientAuthority) -> io::Result<Dir>;
+    pub fn video_dir(&self, ambient_authority: AmbientAuthority)    -> io::Result<Dir>;
+}
+```
+
+`UserDirs::new()` returns `None` if the home directory cannot be determined. Unlike `ProjectDirs`, the `*_dir` methods do **not** create the directory — if the directory does not exist, they return an error.
+
+<Warning>
+  Most `UserDirs` methods (other than `home_dir`) return an error if the
+  directory does not exist on the current system. For example, not all Linux
+  desktops configure an XDG desktop directory.
+</Warning>
+
+### Example
+
+```rust
+use cap_directories::UserDirs;
+use cap_std::ambient_authority;
+
+fn main() -> std::io::Result<()> {
+    let user = UserDirs::new()
+        .ok_or_else(|| std::io::Error::other("no home directory"))?;
+
+    let aa = ambient_authority();
+
+    // Open the user's Downloads directory
+    let downloads = user.download_dir(aa)?;
+    for entry in downloads.entries()? {
+        let entry = entry?;
+        println!("{}", entry.file_name().to_string_lossy());
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## Complete example: a capability-safe key-value store
+
+This pattern (inspired by the `examples/kv-cli.rs` in the cap-std repository) shows how to use `cap-directories` with a real application: a config-file-backed key-value store. The entire data directory is passed around as a `Dir`, so no part of the code after `main` can escape the authorized directory.
+
+```rust
+use cap_directories::ProjectDirs;
+use cap_std::{ambient_authority, fs::Dir};
+use std::io;
+
+struct KvStore {
+    dir: Dir,
+}
+
+impl KvStore {
+    fn open() -> io::Result<Self> {
+        let proj = ProjectDirs::from("", "", "kv-cli", ambient_authority())
+            .ok_or_else(|| io::Error::other("no home directory"))?;
+        let dir = proj.data_dir()?;
+        Ok(Self { dir })
+    }
+
+    fn get(&self, key: &str) -> io::Result<Option<String>> {
+        match self.dir.read_to_string(key) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set(&self, key: &str, value: &str) -> io::Result<()> {
+        self.dir.write(key, value.as_bytes())
+    }
+
+    fn delete(&self, key: &str) -> io::Result<()> {
+        self.dir.remove_file(key)
+    }
+}
+
+fn main() -> io::Result<()> {
+    let store = KvStore::open()?;
+
+    store.set("greeting", "hello, world")?;
+
+    if let Some(value) = store.get("greeting")? {
+        println!("greeting = {value}");
+    }
+
+    store.delete("greeting")?;
+    Ok(())
+}
+```
+
+<Tip>
+  If you need to store structured data (TOML, JSON, etc.) you can use
+  `dir.create("config.toml")` and `dir.open("config.toml")` to get `File`
+  handles within the authorized directory, then parse them with your preferred
+  serde backend.
+</Tip>

@@ -1,0 +1,512 @@
+---
+title: "cap_std::fs — Sandboxed Filesystem API"
+sidebarTitle: "Filesystem"
+description: "Complete reference for cap_std::fs: the Dir type, File, ReadDir, DirEntry, and all sandboxed filesystem operations in cap-std."
+---
+
+The `cap_std::fs` module is a capability-based replacement for `std::fs`. Rather than operating on bare absolute paths or paths relative to the process-wide current working directory, every operation is anchored to a [`Dir`](#dir) — an open directory handle. All paths passed to `Dir` methods must be relative and are resolved entirely within that directory tree, which means symlink escapes, `..` traversals, and absolute path injections are automatically rejected. Where `std::fs` speaks of "the filesystem", `cap_std::fs` speaks of *a* filesystem rooted at a specific open directory.
+
+<Note>
+  A UTF-8-enforcing variant of every type in this module is available in `cap_std::fs_utf8` (enabled with the `fs_utf8` Cargo feature). It uses [`camino::Utf8Path`](https://docs.rs/camino) instead of `std::path::Path`, providing a type-level guarantee that all paths are valid UTF-8.
+</Note>
+
+## Dir
+
+`Dir` is the central type in `cap_std::fs`. It represents an open directory on the filesystem and exposes methods that parallel the free functions in `std::fs` and the constructors of `std::fs::File`, but constrained to paths underneath the open directory.
+
+```rust
+use cap_std::{ambient_authority, fs::Dir};
+
+// Open an existing directory (requires ambient authority at the boundary)
+let dir = Dir::open_ambient_dir("/tmp/my-sandbox", ambient_authority())?;
+
+// Everything else is sandboxed from here on
+dir.create_dir("subdir")?;
+dir.write("subdir/hello.txt", b"hello, world\n")?;
+let contents = dir.read_to_string("subdir/hello.txt")?;
+println!("{contents}");
+# Ok::<(), std::io::Error>(())
+```
+
+### Constructors
+
+#### `Dir::from_std_file`
+```rust
+pub fn from_std_file(std_file: std::fs::File) -> Self
+```
+Wraps an already-open `std::fs::File` as a `Dir`. The caller must ensure the file handle refers to a directory. On Windows, the handle must have been opened *without* `FILE_SHARE_DELETE` to prevent race conditions.
+
+#### `Dir::into_std_file`
+```rust
+pub fn into_std_file(self) -> std::fs::File
+```
+Consumes `self` and returns the underlying `std::fs::File`.
+
+#### `Dir::open_ambient_dir`
+```rust
+pub fn open_ambient_dir<P: AsRef<Path>>(
+    path: P,
+    ambient_authority: AmbientAuthority,
+) -> io::Result<Self>
+```
+Opens any directory by path using the process's ambient authority. This is **not sandboxed** — it may access any path the host process can reach. Call this once at your program's entry point to establish a root, then pass the resulting `Dir` inward.
+
+#### `Dir::open_parent_dir`
+```rust
+pub fn open_parent_dir(&self, ambient_authority: AmbientAuthority) -> io::Result<Self>
+```
+Opens the parent directory (`..`) of `self`. Because this escapes the subtree, it requires `AmbientAuthority`.
+
+#### `Dir::create_ambient_dir_all`
+```rust
+pub fn create_ambient_dir_all<P: AsRef<Path>>(
+    path: P,
+    ambient_authority: AmbientAuthority,
+) -> io::Result<()>
+```
+Recursively creates a directory hierarchy using the host process's ambient authority. Equivalent to `std::fs::create_dir_all`.
+
+#### `Dir::reopen_dir`
+```rust
+pub fn reopen_dir<Filelike: AsFilelike>(dir: &Filelike) -> io::Result<Self>
+```
+Constructs a `Dir` from an existing open file descriptor that already refers to a directory. Useful when interoperating with C/C++ code that has opened a directory with `openat(..., O_DIRECTORY)`.
+
+---
+
+### Opening Files
+
+#### `Dir::open`
+```rust
+pub fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File>
+```
+Opens a file at `path` (relative to `self`) in read-only mode. Corresponds to `std::fs::File::open`.
+
+#### `Dir::open_with`
+```rust
+pub fn open_with<P: AsRef<Path>>(
+    &self,
+    path: P,
+    options: &OpenOptions,
+) -> io::Result<File>
+```
+Opens a file with the options specified by an [`OpenOptions`] builder. Corresponds to `OpenOptions::open`.
+
+```rust
+use cap_std::fs::OpenOptions;
+
+let file = dir.open_with(
+    "data.bin",
+    OpenOptions::new().read(true).write(true),
+)?;
+```
+
+#### `Dir::create`
+```rust
+pub fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<File>
+```
+Opens a file in write-only mode, creating it or truncating it if it exists. Corresponds to `std::fs::File::create`.
+
+---
+
+### Opening Directories
+
+#### `Dir::open_dir`
+```rust
+pub fn open_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<Self>
+```
+Opens a subdirectory, returning a new `Dir` rooted there.
+
+```rust
+let subdir = dir.open_dir("data/uploads")?;
+// subdir is now sandboxed inside data/uploads
+```
+
+---
+
+### Creating Directories
+
+#### `Dir::create_dir`
+```rust
+pub fn create_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()>
+```
+Creates a single new directory. Fails if any ancestor component is missing. Corresponds to `std::fs::create_dir`.
+
+#### `Dir::create_dir_all`
+```rust
+pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()>
+```
+Recursively creates a directory and all missing parent components. Corresponds to `std::fs::create_dir_all`.
+
+#### `Dir::create_dir_with` *(non-WASI)*
+```rust
+pub fn create_dir_with<P: AsRef<Path>>(
+    &self,
+    path: P,
+    dir_builder: &DirBuilder,
+) -> io::Result<()>
+```
+Creates a directory using the options configured in a [`DirBuilder`], including recursive creation when `DirBuilder::recursive(true)` is set. Corresponds to `std::fs::DirBuilder::create`.
+
+---
+
+### Reading and Writing File Contents
+
+#### `Dir::read`
+```rust
+pub fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<u8>>
+```
+Reads the entire contents of a file into a byte vector. Corresponds to `std::fs::read`.
+
+#### `Dir::read_to_string`
+```rust
+pub fn read_to_string<P: AsRef<Path>>(&self, path: P) -> io::Result<String>
+```
+Reads the entire contents of a file into a `String`. Corresponds to `std::fs::read_to_string`.
+
+#### `Dir::write`
+```rust
+pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(
+    &self,
+    path: P,
+    contents: C,
+) -> io::Result<()>
+```
+Writes a byte slice as the entire contents of a file (creating or truncating it). Corresponds to `std::fs::write`.
+
+```rust
+dir.write("config.toml", b"[server]\nport = 8080\n")?;
+let raw = dir.read("config.toml")?;
+let text = dir.read_to_string("config.toml")?;
+```
+
+---
+
+### Iterating Directory Entries
+
+#### `Dir::entries`
+```rust
+pub fn entries(&self) -> io::Result<ReadDir>
+```
+Returns an iterator over the entries within `self` (the directory itself). Corresponds to opening the current directory for iteration.
+
+#### `Dir::read_dir`
+```rust
+pub fn read_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<ReadDir>
+```
+Returns an iterator over the entries within a subdirectory at `path`. Corresponds to `std::fs::read_dir`.
+
+```rust
+for entry in dir.read_dir("logs")? {
+    let entry = entry?;
+    println!("{}", entry.file_name().to_string_lossy());
+}
+```
+
+---
+
+### Metadata and Permissions
+
+#### `Dir::metadata`
+```rust
+pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata>
+```
+Queries metadata (size, type, timestamps) about a file or directory, following symlinks. Corresponds to `std::fs::metadata`.
+
+#### `Dir::dir_metadata`
+```rust
+pub fn dir_metadata(&self) -> io::Result<Metadata>
+```
+Queries metadata about `self` — the open directory itself.
+
+#### `Dir::symlink_metadata`
+```rust
+pub fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata>
+```
+Queries metadata without following symlinks (returns info about the symlink itself). Corresponds to `std::fs::symlink_metadata`.
+
+#### `Dir::set_permissions` *(non-WASI)*
+```rust
+pub fn set_permissions<P: AsRef<Path>>(
+    &self,
+    path: P,
+    perm: Permissions,
+) -> io::Result<()>
+```
+Changes the permissions on a file or directory. Corresponds to `std::fs::set_permissions`.
+
+---
+
+### Existence and Type Checks
+
+#### `Dir::exists`
+```rust
+pub fn exists<P: AsRef<Path>>(&self, path: P) -> bool
+```
+Returns `true` if the path points to an existing entity (follows symlinks).
+
+#### `Dir::try_exists`
+```rust
+pub fn try_exists<P: AsRef<Path>>(&self, path: P) -> io::Result<bool>
+```
+Like `exists`, but distinguishes between "not found" (`Ok(false)`) and genuine I/O errors (`Err`). Mirrors the stabilized `std::fs::try_exists`.
+
+#### `Dir::is_file`
+```rust
+pub fn is_file<P: AsRef<Path>>(&self, path: P) -> bool
+```
+Returns `true` if `path` refers to a regular file (follows symlinks).
+
+#### `Dir::is_dir`
+```rust
+pub fn is_dir<P: AsRef<Path>>(&self, path: P) -> bool
+```
+Returns `true` if `path` refers to a directory (follows symlinks).
+
+---
+
+### Copying, Renaming, and Linking
+
+#### `Dir::copy`
+```rust
+pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    from: P,
+    to_dir: &Self,
+    to: Q,
+) -> io::Result<u64>
+```
+Copies the contents and permission bits of `from` (relative to `self`) to `to` (relative to `to_dir`). Returns the number of bytes copied. Corresponds to `std::fs::copy`.
+
+#### `Dir::rename`
+```rust
+pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    from: P,
+    to_dir: &Self,
+    to: Q,
+) -> io::Result<()>
+```
+Renames `from` (relative to `self`) to `to` (relative to `to_dir`), replacing the destination if it already exists. Corresponds to `std::fs::rename`.
+
+#### `Dir::hard_link`
+```rust
+pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    src: P,
+    dst_dir: &Self,
+    dst: Q,
+) -> io::Result<()>
+```
+Creates a hard link from `src` (relative to `self`) to `dst` (relative to `dst_dir`). Corresponds to `std::fs::hard_link`.
+
+---
+
+### Symbolic Links
+
+#### `Dir::symlink` *(Unix only)*
+```rust
+pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    original: P,
+    link: Q,
+) -> io::Result<()>
+```
+Creates a symlink named `link` (relative to `self`) whose target is `original`. Returns an error if `original` is an absolute path. On Unix, corresponds to `std::os::unix::fs::symlink`.
+
+#### `Dir::symlink_file` *(Windows only)*
+```rust
+pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    original: P,
+    link: Q,
+) -> io::Result<()>
+```
+Creates a file symbolic link on Windows. Corresponds to `std::os::windows::fs::symlink_file`.
+
+#### `Dir::symlink_dir` *(Windows only)*
+```rust
+pub fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    original: P,
+    link: Q,
+) -> io::Result<()>
+```
+Creates a directory symbolic link on Windows. Corresponds to `std::os::windows::fs::symlink_dir`.
+
+#### `Dir::read_link`
+```rust
+pub fn read_link<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf>
+```
+Reads a symbolic link, returning the path it points to. Returns an error if the target is an absolute path. Corresponds to `std::fs::read_link`.
+
+#### `Dir::canonicalize`
+```rust
+pub fn canonicalize<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf>
+```
+Returns the canonical form of a path with all symlinks resolved and components normalized. Unlike `std::fs::canonicalize`, this returns a *relative* path (since absolute paths don't fit the capability model).
+
+---
+
+### Removing Files and Directories
+
+#### `Dir::remove_file`
+```rust
+pub fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()>
+```
+Removes a file. Corresponds to `std::fs::remove_file`.
+
+#### `Dir::remove_dir`
+```rust
+pub fn remove_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<()>
+```
+Removes an empty directory. Corresponds to `std::fs::remove_dir`.
+
+#### `Dir::remove_dir_all`
+```rust
+pub fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()>
+```
+Removes a directory and all its contents recursively. Corresponds to `std::fs::remove_dir_all`.
+
+#### `Dir::remove_open_dir`
+```rust
+pub fn remove_open_dir(self) -> io::Result<()>
+```
+Removes the directory represented by `self` and consumes `self`. The removal is performed via the open handle rather than a path, but is not guaranteed to be atomic with respect to concurrent renames.
+
+#### `Dir::remove_open_dir_all`
+```rust
+pub fn remove_open_dir_all(self) -> io::Result<()>
+```
+Removes the directory represented by `self` and all its contents, then consumes `self`.
+
+---
+
+### Unix Domain Sockets *(Unix only, not yet implemented)*
+
+`Dir` declares `bind_unix_listener`, `connect_unix_stream`, `bind_unix_datagram`, and `connect_unix_datagram` methods for working with Unix domain sockets at paths relative to the directory. These are declared in the API for forward-compatibility but currently panic with `todo!()`. Track [the upstream issue](https://github.com/bytecodealliance/cap-std) for implementation status.
+
+---
+
+### Cloning
+
+#### `Dir::try_clone`
+```rust
+pub fn try_clone(&self) -> io::Result<Self>
+```
+Creates a new `Dir` instance sharing the same underlying file descriptor/handle as `self`.
+
+---
+
+## File
+
+`cap_std::fs::File` wraps `std::fs::File` and implements the same `Read`, `Write`, and `Seek` traits. Unlike `std::fs::File`, it has no `open` or `create` constructors — files are always obtained through a [`Dir`](#dir).
+
+```rust
+let mut file = dir.open("report.txt")?;
+let mut content = String::new();
+use std::io::Read;
+file.read_to_string(&mut content)?;
+```
+
+| Method | Description |
+|--------|-------------|
+| `File::from_std(f)` | Wrap an existing `std::fs::File` |
+| `File::into_std(self)` | Unwrap back to `std::fs::File` |
+| `file.sync_all()` | Sync all OS metadata to disk |
+| `file.sync_data()` | Sync file data (may skip metadata) |
+| `file.set_len(size)` | Truncate or extend the file |
+| `file.metadata()` | Query file metadata |
+| `file.try_clone()` | Clone the file handle |
+| `file.set_permissions(perm)` | Change file permissions |
+| `File::options()` | Return a new `OpenOptions` builder |
+
+### Ambient constructors
+
+`File` also provides `open_ambient`, `create_ambient`, and `open_ambient_with` for opening files by raw path using `AmbientAuthority`. These are escape hatches for interop — prefer using `Dir` methods in new code.
+
+---
+
+## ReadDir
+
+`ReadDir` is an iterator over the entries of a directory. It is obtained from [`Dir::read_dir`](#dirread_dir) or [`Dir::entries`](#direntries).
+
+```rust
+for entry in dir.read_dir(".")? {
+    let entry = entry?;
+    println!("{:?}", entry.file_name());
+}
+```
+
+Each iteration yields `io::Result<DirEntry>`. There is no `from_std` constructor because `std::fs::ReadDir` does not expose the internals needed to build one safely.
+
+---
+
+## DirEntry
+
+`DirEntry` is returned by the `ReadDir` iterator. It provides direct methods to act on the entry without re-resolving a path, which is both more efficient and avoids TOCTOU races.
+
+| Method | Description |
+|--------|-------------|
+| `entry.open()` | Open the entry file for reading |
+| `entry.open_with(options)` | Open with custom `OpenOptions` |
+| `entry.open_dir()` | Open the entry as a `Dir` |
+| `entry.remove_file()` | Remove the file |
+| `entry.remove_dir()` | Remove the directory |
+| `entry.metadata()` | Query entry metadata |
+| `entry.file_type()` | Query the file type |
+| `entry.file_name()` | Get the bare file name (`OsString`) |
+
+Unlike `std::fs::DirEntry`, there is no `path()` method — absolute paths are incompatible with the capability model.
+
+---
+
+## OpenOptions, Metadata, and Permissions
+
+These types are re-exported directly from `cap_primitives` and match the `std` API:
+
+| Type | Re-export source | Notes |
+|------|-----------------|-------|
+| `OpenOptions` | `cap_primitives::fs::OpenOptions` | Same builder API as `std::fs::OpenOptions` |
+| `Metadata` | `cap_primitives::fs::Metadata` | Same as `std::fs::Metadata` |
+| `Permissions` | `cap_primitives::fs::Permissions` | Same as `std::fs::Permissions` |
+| `DirBuilder` | `cap_primitives::fs::DirBuilder` | Same as `std::fs::DirBuilder` |
+| `FileType` | `cap_primitives::fs::FileType` | Same as `std::fs::FileType` |
+| `MetadataExt` | `cap_primitives::fs::MetadataExt` | Platform-specific metadata extensions |
+| `FileExt` | `cap_primitives::fs::FileExt` | Platform-specific file extensions |
+| `OpenOptionsExt` | `cap_primitives::fs::OpenOptionsExt` | Platform-specific open options |
+
+---
+
+## Complete example
+
+```rust
+use cap_std::{ambient_authority, fs::Dir};
+use std::io;
+
+fn process_uploads(uploads: &Dir) -> io::Result<()> {
+    for entry in uploads.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+
+        if entry.file_type()?.is_file() {
+            let data = uploads.read(&name)?;
+            println!("Processing {:?}: {} bytes", name, data.len());
+
+            // Move processed files into an archive subdirectory
+            uploads.rename(&name, uploads, &name)?;
+        }
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let base = Dir::open_ambient_dir("/var/myapp", ambient_authority())?;
+    base.create_dir_all("uploads")?;
+    base.create_dir_all("archive")?;
+
+    let uploads = base.open_dir("uploads")?;
+    process_uploads(&uploads)?;
+    Ok(())
+}
+```

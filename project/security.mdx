@@ -1,0 +1,128 @@
+---
+title: "Security Model and Vulnerability Reporting"
+sidebarTitle: "Security"
+description: "cap-std's RESOLVE_BENEATH security model, what it protects against, known limitations, and how to report vulnerabilities to the Bytecode Alliance."
+---
+
+cap-std is designed with security as a first-class concern. It provides protection against a well-defined class of path-based attacks by enforcing capability-based access through the `Dir` type, while being explicit and transparent about what is — and is not — within its threat model. Understanding both sides of that boundary is essential to using cap-std safely.
+
+## What cap-std Protects Against
+
+### CWE-22: Path Traversal
+
+cap-std directly addresses [CWE-22](https://cwe.mitre.org/data/definitions/22.html), "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')", which ranked **#8** in the [2021 CWE Top 25 Most Dangerous Software Weaknesses](https://cwe.mitre.org/top25/archive/2021/2021_cwe_top25.html). All operations on a `Dir` enforce that the resulting path stays within the directory tree rooted at that `Dir`.
+
+### Absolute Path Escapes
+
+Any path that begins with `/` (or a Windows drive root) is immediately rejected when passed to a `Dir` method. This prevents code from accidentally — or maliciously — bypassing the sandbox by providing a well-known absolute path such as `/etc/resolv.conf`.
+
+```rust
+// This returns a PermissionDenied error — absolute paths are rejected
+let result = dir.open("/etc/passwd");
+assert!(result.is_err());
+```
+
+### Symlink Escapes
+
+cap-std validates every symlink it traverses during path resolution. A symlink whose target would resolve to a location outside the `Dir` is rejected with a `PermissionDenied` error.
+
+```rust
+// If misdirection.txt is a symlink to /hidden.txt,
+// this returns PermissionDenied
+dir.symlink("/hidden.txt", "misdirection.txt")?;
+let result = dir.open("misdirection.txt");
+assert!(result.is_err());
+
+// Likewise, .. escapes are caught
+let result = dir.open("../sibling_dir/secret.txt");
+assert!(result.is_err());
+```
+
+This is enforced using `RESOLVE_BENEATH` semantics on platforms that support it natively (Linux 5.6+ via `openat2`, FreeBSD 13.0+ via `openat(O_RESOLVE_BENEATH)`), and via careful component-by-component resolution with explicit symlink checks on all other platforms.
+
+### `/proc/self/mem` and Procfs Attacks on Linux
+
+cap-std can be used to prevent untrusted input from inducing programs to open `/proc/self/mem` (or other sensitive `/proc` entries) on Linux, since absolute paths like `/proc/self/mem` are rejected outright by any `Dir` operation. When cap-std uses `/proc/self/fd` internally for its own optimizations, it first verifies that `/proc` is genuinely mounted as `procfs` with no extra mounts on top of it, to prevent a compromised `/proc` from undermining the sandbox.
+
+## What cap-std Does NOT Protect Against
+
+<Warning>
+  cap-std is **not** a sandbox for untrusted Rust code. It cannot prevent unsafe
+  or malicious code within the same process from bypassing its protections.
+</Warning>
+
+### Unsafe Rust Code
+
+Any code in your process that uses `unsafe` can bypass the sandbox — for example by directly invoking syscalls, manipulating raw file descriptors, or calling libc functions. cap-std makes no attempt to prevent this.
+
+### Direct Use of `std::fs` APIs
+
+Code that calls `std::fs::File::open("/anything/you/want.txt")` directly is not constrained by cap-std in any way. cap-std only protects paths routed through its own `Dir`-based API.
+
+```rust
+// This bypasses cap-std entirely — cap-std cannot prevent this
+use std::fs;
+let file = fs::File::open("/etc/passwd")?; // no sandboxing
+```
+
+### Untrusted Rust Code in General
+
+cap-std is designed for use with **trusted code that opts in** to the capability model. It allows that code to declare its intent — "I only need files under this `Dir`" — and enforces that intent. It cannot make guarantees about arbitrary third-party or untrusted Rust code running in the same process.
+
+<Note>
+  cap-std's value is in enabling code to opt in to protection from malicious
+  path names and to declare its access intent clearly. Code that accepts a `Dir`
+  instead of a bare path string communicates that intent to its callers.
+</Note>
+
+## `RESOLVE_BENEATH` vs. `RESOLVE_IN_ROOT`
+
+cap-std uses **`RESOLVE_BENEATH`** semantics, which means that absolute path strings and symlinks to absolute paths are treated as **errors**, not as references to a virtual root. This is a deliberate security design choice that differs from some other crates (such as [`pathrs`](https://crates.io/crates/pathrs) and [`unix_fd`](https://crates.io/crates/unix_fd), which use `RESOLVE_IN_ROOT`).
+
+There are three reasons cap-std uses `RESOLVE_BENEATH`:
+
+**1. Capability granularity.** Capability-based security encourages having separate, isolated handles for each directory a program needs, rather than a single "root" that encompasses everything. `RESOLVE_BENEATH` reinforces this model by treating each `Dir` as a self-contained authority with no implicit relationship to other parts of the filesystem.
+
+**2. Early detection of ambient-authority bugs.** Many programs have well-known absolute path strings embedded in them, such as `"/etc/resolv.conf"`. If such a string is accidentally passed to a `Dir` method, `RESOLVE_BENEATH` catches the error immediately rather than silently interpreting it as a path inside the `Dir` (as `RESOLVE_IN_ROOT` would). This prevents hard-to-diagnose bugs where user content inside a `Dir` accidentally triggers access to a system path.
+
+**3. Consistent symlink behavior.** With `RESOLVE_BENEATH`, a symlink to an absolute path inside a `Dir` is *always* an error, everywhere. With `RESOLVE_IN_ROOT`, the same symlink might succeed and resolve to something different depending on the process's filesystem namespace — an inconsistency that can lead to subtle, environment-dependent security bugs.
+
+<Note>
+  This design means cap-std is not suitable as a drop-in replacement for
+  chroot-style "re-rooting" where absolute paths inside a subtree should be
+  interpreted relative to that subtree. For that use case, `RESOLVE_IN_ROOT`
+  semantics (as in `pathrs`) are more appropriate.
+</Note>
+
+## Reporting Vulnerabilities
+
+cap-std is a [Bytecode Alliance](https://bytecodealliance.org/) project. Security vulnerabilities are handled through the Bytecode Alliance security process.
+
+<Warning>
+  **Do not report security vulnerabilities as public GitHub issues.** Public
+  disclosure before a fix is available may put users at risk.
+</Warning>
+
+To report a vulnerability in cap-std or any other Bytecode Alliance software or service:
+
+1. Send an email to [security@bytecodealliance.org](mailto:security@bytecodealliance.org).
+2. Include a detailed description of the issue, reproducible steps, and a clearly defined impact assessment.
+3. Submit **one vulnerability per report**.
+4. Allow a reasonable amount of time for the security team to review, validate, and prepare a fix before any public or third-party disclosure.
+
+Your submission will be reviewed and validated by a member of the Bytecode Alliance security team.
+
+<Note>
+  Social engineering (phishing, vishing, smishing) is prohibited and will not
+  be treated as a qualifying security report.
+</Note>
+
+## Safe Harbor
+
+The Bytecode Alliance supports safe harbor for security researchers who conduct their research in good faith. The Bytecode Alliance will consider activities conducted consistent with the following conditions to constitute "authorized" conduct, and will not pursue civil action or initiate a complaint to law enforcement:
+
+- Make a good faith effort to avoid privacy violations, destruction of data, and interruption or degradation of services.
+- Only interact with accounts you own or with explicit permission of the account holder. If you encounter Personally Identifiable Information (PII), contact the Bytecode Alliance immediately, do not proceed with access, and immediately purge any local information.
+- Provide a reasonable amount of time to resolve vulnerabilities before any public or third-party disclosure.
+
+The Bytecode Alliance will also help to the extent it can if legal action is initiated by a third party against you for research conducted under these conditions. Please submit a report before engaging in conduct that may be inconsistent with or unaddressed by this policy.

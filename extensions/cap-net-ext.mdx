@@ -1,0 +1,284 @@
+---
+title: "cap-net-ext: Extended Network Traits"
+sidebarTitle: "cap-net-ext"
+description: "Split-out socket, bind, listen, accept, and connect operations with non-blocking mode extensions for cap-std's TcpListener, UdpSocket, and Pool."
+---
+
+The `cap-net-ext` crate adds extension traits to `cap-std`'s network types, exposing the individual `socket`, `bind`, `listen`, `accept`, and `connect` steps that the standard library combines into a single call. It also provides fine-grained control over blocking mode when creating or accepting sockets — all within `cap-std`'s capability-based security model.
+
+## Installation
+
+```toml
+[dependencies]
+cap-net-ext = "4.0.3"
+```
+
+---
+
+## Overview
+
+`cap-std`'s `TcpListener` follows the Rust standard library by combining `socket`, `bind`, `listen` (or `connect`) into a single high-level call. `cap-net-ext` breaks those steps apart so you can:
+
+- Create a socket and set its blocking mode before binding or connecting.
+- Bind or connect through a `Pool` (capability check) separately from socket creation.
+- Accept new connections with optional non-blocking mode on the accepted socket.
+- Perform the same split operations for UDP sockets.
+
+<CardGroup cols={2}>
+  <Card title="TCP listener flow" icon="server">
+    `TcpListenerExt::new` → `PoolExt::bind_existing_tcp_listener` → `TcpListenerExt::listen` → `TcpListener::accept` / `TcpListenerExt::accept_with`
+  </Card>
+  <Card title="TCP connect flow" icon="arrow-right-arrow-left">
+    `TcpListenerExt::new` → `PoolExt::connect_into_tcp_stream`
+  </Card>
+</CardGroup>
+
+---
+
+## Types
+
+### `AddressFamily`
+
+Specifies whether a new socket should be IPv4 or IPv6.
+
+```rust
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    pub fn of_ip_addr(ip_addr: IpAddr) -> Self;
+    pub fn of_socket_addr(socket_addr: SocketAddr) -> Self;
+}
+```
+
+### `Blocking`
+
+Controls whether the created or accepted socket is in blocking or non-blocking mode.
+
+```rust
+pub enum Blocking {
+    Yes,
+    No,
+}
+```
+
+---
+
+## Traits
+
+### `TcpListenerExt`
+
+Extends `cap_std::net::TcpListener` with split-out socket creation, listen enabling, and accept with blocking control.
+
+```rust
+pub trait TcpListenerExt: Sized {
+    fn new(address_family: AddressFamily, blocking: Blocking) -> io::Result<Self>;
+    fn listen(&self, backlog: Option<i32>) -> io::Result<()>;
+    fn accept_with(&self, blocking: Blocking) -> io::Result<(TcpStream, SocketAddr)>;
+}
+```
+
+| Method | Description |
+|---|---|
+| `new` | Performs the `socket(2)` call. The returned listener is **not yet bound or listening**. |
+| `listen` | Enables listening on a bound socket. Pass `None` for `backlog` to use the platform default (128 on most systems). |
+| `accept_with` | Accepts a new connection; the resulting `TcpStream` is set to blocking or non-blocking mode as specified. The accept call itself may still block if the listener socket is in blocking mode. |
+
+### `UdpSocketExt`
+
+Extends `cap_std::net::UdpSocket` with split-out socket creation.
+
+```rust
+pub trait UdpSocketExt: Sized {
+    fn new(address_family: AddressFamily, blocking: Blocking) -> io::Result<Self>;
+}
+```
+
+The returned `UdpSocket` is not yet bound or connected. Use `PoolExt::bind_existing_udp_socket` or `PoolExt::connect_existing_udp_socket` to complete setup.
+
+---
+
+### `PoolExt`
+
+Extends `cap_std::net::Pool` with methods that check addresses against the pool's allow-list and then perform the `bind` or `connect` syscall on an already-created socket.
+
+```rust
+pub trait PoolExt {
+    // TCP
+    fn bind_existing_tcp_listener<A: ToSocketAddrs>(
+        &self, listener: &TcpListener, addrs: A,
+    ) -> io::Result<()>;
+
+    fn connect_into_tcp_stream<A: ToSocketAddrs>(
+        &self, socket: TcpListener, addrs: A,
+    ) -> io::Result<TcpStream>;
+
+    fn connect_existing_tcp_listener<A: ToSocketAddrs>(
+        &self, socket: &TcpListener, addrs: A,
+    ) -> io::Result<()>;
+
+    // UDP
+    fn bind_existing_udp_socket<A: ToSocketAddrs>(
+        &self, socket: &UdpSocket, addrs: A,
+    ) -> io::Result<()>;
+
+    fn connect_existing_udp_socket<A: ToSocketAddrs>(
+        &self, socket: &UdpSocket, addrs: A,
+    ) -> io::Result<()>;
+
+    // Batch helpers
+    fn tcp_binder<A: ToSocketAddrs>(&self, addrs: A) -> io::Result<TcpBinder>;
+    fn udp_binder<A: ToSocketAddrs>(&self, addrs: A) -> io::Result<UdpBinder>;
+    fn tcp_connecter<A: ToSocketAddrs>(&self, addrs: A) -> io::Result<TcpConnecter>;
+    fn udp_connecter<A: ToSocketAddrs>(&self, addrs: A) -> io::Result<UdpConnecter>;
+}
+```
+
+| Method | Description |
+|---|---|
+| `bind_existing_tcp_listener` | Checks the address against the pool, then binds the listener. The listener must subsequently be passed to `listen` before accepting connections. |
+| `connect_into_tcp_stream` | Checks the address, connects the socket, and converts the `TcpListener` into a `TcpStream`. |
+| `connect_existing_tcp_listener` | Like above, but leaves the fd in the existing `TcpListener`. |
+| `bind_existing_udp_socket` | Checks the address and binds a UDP socket. |
+| `connect_existing_udp_socket` | Checks the address and connects a UDP socket. |
+| `tcp_binder` | Pre-validates addresses up front and returns a `TcpBinder` for repeated use. |
+| `udp_binder` | Pre-validates addresses and returns a `UdpBinder`. |
+| `tcp_connecter` | Pre-validates addresses and returns a `TcpConnecter`. |
+| `udp_connecter` | Pre-validates addresses and returns a `UdpConnecter`. |
+
+<Note>
+  Because `ToSocketAddrs` can yield both IPv4 and IPv6 addresses, it is
+  recommended to resolve addresses to concrete `SocketAddr`s before creating a
+  socket with `TcpListenerExt::new` so you can pass the correct `AddressFamily`.
+</Note>
+
+---
+
+## Batch helpers: `TcpBinder`, `UdpBinder`, `TcpConnecter`, `UdpConnecter`
+
+These types check pool permissions **once** at construction time and can be reused for multiple `bind` or `connect` calls without re-checking the pool. This is useful when creating many sockets that all connect to the same address set.
+
+```rust
+pub struct TcpBinder { /* ... */ }
+impl TcpBinder {
+    pub fn bind_existing_tcp_listener(&self, listener: &TcpListener) -> io::Result<()>;
+}
+
+pub struct TcpConnecter { /* ... */ }
+impl TcpConnecter {
+    pub fn connect_into_tcp_stream(&self, socket: TcpListener) -> io::Result<TcpStream>;
+    pub fn connect_existing_tcp_listener(&self, socket: &TcpListener) -> io::Result<()>;
+}
+```
+
+---
+
+## Examples
+
+### TCP server with split socket steps
+
+```rust
+use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt, PoolExt};
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+
+// Build a Pool that allows binding on 127.0.0.1:8080
+let mut pool = Pool::new();
+pool.insert_ip_net_port_range(
+    "127.0.0.1".parse().unwrap(),
+    32,
+    Some(8080),
+    Some(8080),
+    ambient_authority(),
+);
+
+// Step 1: create the socket (not yet bound)
+let listener = cap_std::net::TcpListener::new(AddressFamily::Ipv4, Blocking::Yes)?;
+
+// Step 2: bind through the pool (permission check happens here)
+pool.bind_existing_tcp_listener(&listener, "127.0.0.1:8080")?;
+
+// Step 3: enable listening
+listener.listen(Some(128))?;
+
+// Step 4: accept connections
+loop {
+    let (stream, addr) = listener.accept()?;
+    println!("connection from {addr}");
+}
+```
+
+### Non-blocking TCP server
+
+```rust
+use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt, PoolExt};
+
+// Create the socket in non-blocking mode
+let listener = cap_std::net::TcpListener::new(AddressFamily::Ipv4, Blocking::No)?;
+pool.bind_existing_tcp_listener(&listener, "127.0.0.1:9000")?;
+listener.listen(None)?;
+
+// Accept connections; each accepted TcpStream will also be non-blocking
+match listener.accept_with(Blocking::No) {
+    Ok((stream, addr)) => { /* handle */ }
+    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { /* poll later */ }
+    Err(e) => return Err(e),
+}
+```
+
+### TCP client with split connect
+
+```rust
+use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt, PoolExt};
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+use std::net::SocketAddr;
+
+let addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
+
+let mut pool = Pool::new();
+pool.insert_ip_net_port_range(
+    addr.ip(),
+    32,
+    Some(addr.port()),
+    Some(addr.port()),
+    ambient_authority(),
+);
+
+// Create an unconnected TCP socket
+let socket = cap_std::net::TcpListener::new(
+    AddressFamily::of_socket_addr(addr),
+    Blocking::Yes,
+)?;
+
+// Connect through the pool — converts TcpListener → TcpStream
+let stream = pool.connect_into_tcp_stream(socket, addr)?;
+```
+
+### UDP with split bind
+
+```rust
+use cap_net_ext::{AddressFamily, Blocking, UdpSocketExt, PoolExt};
+
+let socket = cap_std::net::UdpSocket::new(AddressFamily::Ipv4, Blocking::Yes)?;
+pool.bind_existing_udp_socket(&socket, "0.0.0.0:4567")?;
+socket.send_to(b"hello", "127.0.0.1:4567")?;
+```
+
+### Using `TcpConnecter` for repeated connections
+
+```rust
+use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt, PoolExt};
+
+// Check permissions once
+let connecter = pool.tcp_connecter("example.com:443")?;
+
+// Reuse for multiple connections without re-checking the pool
+for _ in 0..3 {
+    let socket = cap_std::net::TcpListener::new(AddressFamily::Ipv4, Blocking::Yes)?;
+    let stream = connecter.connect_into_tcp_stream(socket)?;
+    // use stream ...
+}
+```

@@ -1,0 +1,232 @@
+---
+title: "cap-tempfile: Capability-Based Temporary Directories"
+sidebarTitle: "cap-tempfile"
+description: "Create temporary directories and files that expose Dir handles instead of paths, keeping temp I/O inside cap-std's capability model."
+---
+
+The `cap-tempfile` crate provides capability-based temporary directory and file creation. It mirrors the interface of the popular [`tempfile`](https://crates.io/crates/tempfile) crate, but instead of returning `Path`s it returns `cap_std::fs::Dir` and `cap_std::fs::File` handles — so all subsequent operations on the temporary storage remain confined by the capability model and no raw filesystem paths are exposed.
+
+## Installation
+
+```toml
+[dependencies]
+cap-tempfile = "4.0.3"
+```
+
+---
+
+## Comparison with the `tempfile` crate
+
+| | `tempfile` | `cap-tempfile` |
+|---|---|---|
+| Main directory type | `tempfile::TempDir` | `cap_tempfile::TempDir` |
+| Access to path | `TempDir::path()` → `&Path` | Not available (no path exposure) |
+| Access to contents | Via `AsRef<Path>` | Via `Deref<Target = Dir>` |
+| Temp file type | `tempfile::NamedTempFile` | `cap_tempfile::TempFile` |
+| Atomic file replacement | `persist()` → returns `NamedTempFile::path` | `TempFile::replace(destname)` |
+| Ambient access required | Implicitly at creation | Explicit `AmbientAuthority` for `TempDir::new` |
+
+The key difference is that `cap-tempfile`'s `TempDir` **does not expose `path()`**. Absolute paths don't interoperate well with the capability model, so the only way to interact with the directory's contents is through the `Dir` obtained by dereferencing the `TempDir`.
+
+---
+
+## `TempDir`
+
+A temporary directory that is automatically deleted when it goes out of scope.
+
+```rust
+pub struct TempDir { /* private */ }
+
+impl TempDir {
+    /// Create a temp dir inside `env::temp_dir()`. Requires ambient authority.
+    pub fn new(ambient_authority: AmbientAuthority) -> io::Result<Self>;
+
+    /// Create a temp dir inside an existing `Dir` (no ambient authority needed).
+    pub fn new_in(dir: &Dir) -> io::Result<Self>;
+
+    /// Make the directory permanent, returning the inner `Dir`.
+    pub fn into_dir(self) -> io::Result<Dir>;
+
+    /// Explicitly close and remove the directory, returning any error.
+    pub fn close(self) -> io::Result<()>;
+}
+
+impl Deref for TempDir {
+    type Target = Dir;
+    // ...
+}
+```
+
+`TempDir` implements `Deref<Target = Dir>`, so you can call any `Dir` method directly on a `TempDir` reference.
+
+### Convenience functions
+
+```rust
+/// Create a temp dir in `env::temp_dir()` (requires ambient authority).
+pub fn tempdir(ambient_authority: AmbientAuthority) -> io::Result<TempDir>;
+
+/// Create a temp dir inside an existing `Dir`.
+pub fn tempdir_in(dir: &Dir) -> io::Result<TempDir>;
+```
+
+---
+
+### Creating and using a temp directory
+
+```rust
+use cap_tempfile::{tempdir, ambient_authority};
+
+fn main() -> std::io::Result<()> {
+    // Creates a uniquely-named directory under the system temp dir
+    let tmp = tempdir(ambient_authority())?;
+
+    // Use it as a Dir — no path involved
+    tmp.write("hello.txt", b"hello, world")?;
+
+    let contents = tmp.read_to_string("hello.txt")?;
+    println!("{contents}");
+
+    // The directory and its contents are removed when `tmp` is dropped
+    Ok(())
+}
+```
+
+### Creating a temp dir inside an existing `Dir`
+
+```rust
+use cap_tempfile::tempdir_in;
+use cap_std::{ambient_authority, fs::Dir};
+
+let work_dir = Dir::open_ambient_dir("/var/myapp/scratch", ambient_authority())?;
+
+// No ambient authority needed — the permission comes from `work_dir`
+let tmp = tempdir_in(&work_dir)?;
+tmp.create("output.bin")?;
+// tmp deleted on drop
+```
+
+### Making a directory permanent
+
+```rust
+use cap_tempfile::{tempdir, ambient_authority};
+
+let tmp = tempdir(ambient_authority())?;
+tmp.write("data.csv", b"a,b,c\n1,2,3")?;
+
+// Consumes `tmp`, preventing deletion on drop; returns the inner Dir
+let permanent: cap_std::fs::Dir = tmp.into_dir()?;
+// The directory now persists after this function returns
+```
+
+### Explicit close with error handling
+
+```rust
+use cap_tempfile::{tempdir, ambient_authority};
+
+let tmp = tempdir(ambient_authority())?;
+// ... populate tmp ...
+
+// Use close() instead of drop() to surface cleanup errors
+tmp.close()?;
+```
+
+---
+
+## `TempFile`
+
+`TempFile` is a temporary file tied to a `Dir`. It is deleted when dropped unless `replace` is called to atomically rename it into place.
+
+```rust
+pub struct TempFile<'d> { /* private */ }
+
+impl<'d> TempFile<'d> {
+    /// Create a new temporary file inside `dir`.
+    pub fn new(dir: &'d Dir) -> io::Result<Self>;
+
+    /// Create an anonymous (never-named) temporary file. Returns a plain File.
+    pub fn new_anonymous(dir: &'d Dir) -> io::Result<File>;
+
+    pub fn as_file(&self)         -> &File;
+    pub fn as_file_mut(&mut self) -> &mut File;
+
+    /// Atomically rename the temp file to `destname` inside the same `Dir`.
+    pub fn replace(self, destname: impl AsRef<OsStr>) -> io::Result<()>;
+}
+
+impl Read  for TempFile<'_> { /* ... */ }
+impl Write for TempFile<'_> { /* ... */ }
+impl Seek  for TempFile<'_> { /* ... */ }
+```
+
+### Atomically writing a new file
+
+```rust
+use cap_tempfile::TempFile;
+use cap_std::{ambient_authority, fs::Dir};
+use std::io::Write;
+
+fn atomic_write(dir: &Dir, filename: &str, data: &[u8]) -> std::io::Result<()> {
+    let mut tmp = TempFile::new(dir)?;
+    tmp.write_all(data)?;
+    tmp.flush()?;
+    // Atomically replace (or create) `filename` in `dir`
+    tmp.replace(filename)?;
+    Ok(())
+}
+```
+
+<Tip>
+  On Linux, `TempFile::new` uses `O_TMPFILE` when the filesystem supports it.
+  This means the file has no name until `replace` is called, so a crash before
+  `replace` automatically cleans up the partial write with no leftover temp file.
+</Tip>
+
+### Anonymous files
+
+`TempFile::new_anonymous` creates a file that never has a name in the filesystem. It is always cleaned up on drop (or process exit), making it suitable for scratch buffers.
+
+```rust
+use cap_tempfile::TempFile;
+use cap_std::{ambient_authority, fs::Dir};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+let tmp_dir = cap_tempfile::tempdir(ambient_authority())?;
+
+let mut scratch = TempFile::new_anonymous(&*tmp_dir)?;
+scratch.write_all(b"temporary scratch data")?;
+scratch.seek(SeekFrom::Start(0))?;
+
+let mut buf = String::new();
+scratch.read_to_string(&mut buf)?;
+```
+
+---
+
+## Use in tests
+
+`TempDir` is particularly useful in tests. Because it derefs to `Dir`, you can pass it directly to any function that accepts `&Dir`:
+
+```rust
+#[test]
+fn test_config_roundtrip() -> std::io::Result<()> {
+    use cap_tempfile::{tempdir, ambient_authority};
+
+    let tmp = tempdir(ambient_authority())?;
+
+    // Write a config file using the Dir interface
+    tmp.write("config.toml", b"[server]\nport = 8080\n")?;
+
+    // Read it back
+    let content = tmp.read_to_string("config.toml")?;
+    assert!(content.contains("8080"));
+
+    Ok(()) // tmp auto-deleted here
+}
+```
+
+<Note>
+  Each test should create its own `TempDir` with `tempdir_in` pointing at an
+  already-authorized `Dir`, or use `TempDir::new(ambient_authority())` if
+  ambient access is acceptable in your test suite. The directory is cleaned up
+  automatically even if the test panics.
+</Note>

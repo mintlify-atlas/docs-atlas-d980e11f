@@ -1,0 +1,352 @@
+---
+title: "cap-fs-ext: Extended Filesystem Traits"
+sidebarTitle: "cap-fs-ext"
+description: "Extension traits for cap-std's Dir, File, and related types — timestamps, symlinks, sync modes, access checks, reopen, and cross-platform metadata."
+---
+
+The `cap-fs-ext` crate adds extension traits to `cap-std`'s filesystem types, filling in capabilities that exist in platform APIs but are absent from Rust's standard library. It covers timestamp manipulation, symlink creation, directory-specific open options, file-handle reopening, cross-platform device and inode metadata, and more — all while preserving the capability-based security model of `cap-std`.
+
+## Installation
+
+```toml
+[dependencies]
+cap-fs-ext = "4.0.3"
+```
+
+The `std` feature is enabled by default and provides implementations for `cap_std::fs::Dir` and related types. Enable `fs_utf8` to also get `DirExtUtf8` implementations for `cap_std::fs_utf8::Dir`.
+
+---
+
+## Traits
+
+### `DirExt`
+
+`DirExt` extends `cap_std::fs::Dir` with operations that aren't in `std::fs` but are commonly needed — particularly around symlinks, timestamps, and access checks.
+
+```rust
+use cap_fs_ext::{DirExt, SystemTimeSpec, AccessType};
+
+// All methods take paths relative to the Dir — no ambient path access.
+pub trait DirExt {
+    fn set_atime<P: AsRef<Path>>(&self, path: P, atime: SystemTimeSpec) -> io::Result<()>;
+    fn set_mtime<P: AsRef<Path>>(&self, path: P, mtime: SystemTimeSpec) -> io::Result<()>;
+    fn set_times<P: AsRef<Path>>(
+        &self, path: P,
+        atime: Option<SystemTimeSpec>,
+        mtime: Option<SystemTimeSpec>,
+    ) -> io::Result<()>;
+    fn set_symlink_times<P: AsRef<Path>>(
+        &self, path: P,
+        atime: Option<SystemTimeSpec>,
+        mtime: Option<SystemTimeSpec>,
+    ) -> io::Result<()>;
+
+    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> io::Result<()>;
+    fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q) -> io::Result<()>;
+    fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(&self, src: P, dst: Q)  -> io::Result<()>;
+
+    fn open_dir_nofollow<P: AsRef<Path>>(&self, path: P) -> io::Result<Self>;
+    fn remove_file_or_symlink<P: AsRef<Path>>(&self, path: P) -> io::Result<()>;
+
+    fn access<P: AsRef<Path>>(&self, path: P, type_: AccessType) -> io::Result<()>;
+    fn access_symlink<P: AsRef<Path>>(&self, path: P, type_: AccessType) -> io::Result<()>;
+
+    fn set_symlink_permissions<P: AsRef<Path>>(
+        &self, path: P, perm: Permissions,
+    ) -> io::Result<()>;
+}
+```
+
+| Method | Description |
+|---|---|
+| `set_atime` | Sets the last-access timestamp on a file (follows symlinks). Corresponds to `filetime::set_file_atime`. |
+| `set_mtime` | Sets the last-modification timestamp on a file (follows symlinks). Corresponds to `filetime::set_file_mtime`. |
+| `set_times` | Sets both atime and mtime in one call (follows symlinks). |
+| `set_symlink_times` | Like `set_times` but **does not** follow the final symlink component. |
+| `symlink` | Creates a symbolic link — cross-platform, not guaranteed atomic. |
+| `symlink_file` | Creates a file symlink. On Windows, fails if the target is a directory. |
+| `symlink_dir` | Creates a directory symlink. On Windows, fails if the target is a file. |
+| `open_dir_nofollow` | Like `Dir::open_dir` but fails if the path's final component is a symlink. |
+| `remove_file_or_symlink` | Removes a file or any symlink, including directory symlinks on Windows. |
+| `access` | Tests existence or accessibility of a filesystem object (follows symlinks). |
+| `access_symlink` | Like `access` but does not follow the final symlink. |
+| `set_symlink_permissions` | Changes permissions without following a symlink. |
+
+`SystemTimeSpec` can be either a specific `SystemTime` or the special value `SystemTimeSpec::SymbolicNow` (meaning "set to the current time without an extra syscall").
+
+`AccessType` has variants for `Exists`, `ReadOk`, `WriteOk`, and `ExecOk`.
+
+#### Setting timestamps
+
+```rust
+use cap_fs_ext::{DirExt, SystemTimeSpec};
+use cap_std::{ambient_authority, fs::Dir};
+use std::time::SystemTime;
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+// Touch the access time to "now" without reading the clock yourself:
+dir.set_atime("data.csv", SystemTimeSpec::SymbolicNow)?;
+
+// Set both timestamps to a specific point in time:
+let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+dir.set_times("archive.tar", Some(SystemTimeSpec::Absolute(ts)), Some(SystemTimeSpec::Absolute(ts)))?;
+```
+
+#### Symlinks and access checks
+
+```rust
+use cap_fs_ext::{DirExt, AccessType};
+use cap_std::{ambient_authority, fs::Dir};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+// Create a cross-platform symlink:
+dir.symlink("target.txt", "link.txt")?;
+
+// Check that a file exists and is readable, without following it if it's a symlink:
+match dir.access_symlink("link.txt", AccessType::ReadOk) {
+    Ok(()) => println!("readable"),
+    Err(e) => println!("not readable: {e}"),
+}
+
+// Remove a symlink-to-directory correctly on Windows:
+dir.remove_file_or_symlink("link.txt")?;
+```
+
+#### Open a directory without following its final symlink
+
+```rust
+use cap_fs_ext::DirExt;
+use cap_std::{ambient_authority, fs::Dir};
+
+let parent = Dir::open_ambient_dir(".", ambient_authority())?;
+
+// Fails if "subdir" is itself a symlink:
+let sub = parent.open_dir_nofollow("subdir")?;
+```
+
+<Note>
+  When the `fs_utf8` Cargo feature is enabled, a parallel `DirExtUtf8` trait is
+  available for `cap_std::fs_utf8::Dir`, with all the same methods but accepting
+  `&camino::Utf8Path` instead of `&std::path::Path`.
+</Note>
+
+---
+
+### `DirEntryExt`
+
+Extends `cap_std::fs::DirEntry` with a way to retrieve fully-populated metadata, which on Windows includes optional fields that are not always available through the standard `metadata()` call.
+
+```rust
+pub trait DirEntryExt {
+    fn full_metadata(&self) -> io::Result<Metadata>;
+}
+```
+
+If full metadata cannot be computed, `full_metadata` returns an error rather than silently falling back to partial information. If partial metadata is acceptable, use `std::fs::DirEntry::metadata` directly.
+
+```rust
+use cap_fs_ext::DirEntryExt;
+use cap_std::{ambient_authority, fs::Dir};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+for entry in dir.entries()? {
+    let entry = entry?;
+    let meta = entry.full_metadata()?;
+    println!("{:?}: {} bytes", entry.file_name(), meta.len());
+}
+```
+
+---
+
+### `MetadataExt`
+
+Extends `cap_primitives::fs::Metadata` (and `std::fs::Metadata`) with device, inode, and hard-link-count fields that are normally Unix-only. On Windows, `cap-fs-ext` uses the Windows-by-handle API to provide equivalent values.
+
+```rust
+pub trait MetadataExt {
+    fn dev(&self) -> u64;   // Device ID / volume serial number
+    fn ino(&self) -> u64;   // Inode number / file index
+    fn nlink(&self) -> u64; // Number of hard links
+}
+```
+
+```rust
+use cap_fs_ext::MetadataExt;
+use cap_std::{ambient_authority, fs::Dir};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+let meta = dir.metadata("file.txt")?;
+
+println!("dev={} ino={} links={}", meta.dev(), meta.ino(), meta.nlink());
+```
+
+<Warning>
+  On Windows, `dev` and `ino` require that the `Metadata` was obtained from an
+  open file handle. Metadata obtained via `std::fs::metadata` (path-based) will
+  panic when `.dev()` or `.ino()` are called.
+</Warning>
+
+---
+
+### `OpenOptionsFollowExt`
+
+Adds a `follow` method to `OpenOptions` to control whether a symbolic link in the **last path component** is followed when opening a file.
+
+```rust
+pub trait OpenOptionsFollowExt {
+    fn follow(&mut self, follow: FollowSymlinks) -> &mut Self;
+}
+```
+
+`FollowSymlinks` has two variants: `FollowSymlinks::Yes` (the standard behavior) and `FollowSymlinks::No` (fail if the final component is a symlink).
+
+```rust
+use cap_fs_ext::{OpenOptionsFollowExt, FollowSymlinks};
+use cap_std::{ambient_authority, fs::{Dir, OpenOptions}};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+let mut opts = OpenOptions::new();
+opts.read(true).follow(FollowSymlinks::No);
+
+// Returns an error if "config.toml" is a symlink:
+let file = dir.open_with("config.toml", &opts)?;
+```
+
+---
+
+### `OpenOptionsSyncExt`
+
+Adds data-integrity and non-blocking I/O options to `OpenOptions`, mirroring the POSIX `O_SYNC`, `O_DSYNC`, `O_RSYNC`, and `O_NONBLOCK` flags.
+
+```rust
+pub trait OpenOptionsSyncExt {
+    fn sync(&mut self, enable: bool) -> &mut Self;
+    fn dsync(&mut self, enable: bool) -> &mut Self;
+    fn rsync(&mut self, enable: bool) -> &mut Self;
+    fn nonblock(&mut self, enable: bool) -> &mut Self;
+}
+```
+
+| Method | Description |
+|---|---|
+| `sync` | Write operations complete only after file-integrity synchronization (data + metadata). |
+| `dsync` | Write operations complete only after data-integrity synchronization (data only). Corresponds to `O_DSYNC`. |
+| `rsync` | Read operations complete at the level of integrity specified by `sync`/`dsync`. |
+| `nonblock` | I/O operations return `WouldBlock` instead of blocking. Not universally effective for regular files. |
+
+```rust
+use cap_fs_ext::OpenOptionsSyncExt;
+use cap_std::{ambient_authority, fs::{Dir, OpenOptions}};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+// Open a write-ahead-log with data-integrity synchronization:
+let mut opts = OpenOptions::new();
+opts.write(true).create(true).append(true).dsync(true);
+let wal = dir.open_with("wal.log", &opts)?;
+```
+
+---
+
+### `OpenOptionsMaybeDirExt`
+
+Adds `maybe_dir` to `OpenOptions`, which suppresses the error that would otherwise occur when the opened path names a directory. On POSIX platforms, opening a directory always succeeds; on Windows, this option is required.
+
+```rust
+pub trait OpenOptionsMaybeDirExt {
+    fn maybe_dir(&mut self, maybe_dir: bool) -> &mut Self;
+}
+```
+
+<Note>
+  Setting `maybe_dir(true)` on Windows may prevent the directory from being
+  deleted or renamed while the handle is open.
+</Note>
+
+---
+
+### `IsFileReadWrite`
+
+Tests whether an open file handle is readable and/or writable. This is useful for inspecting the access mode of a `File` at runtime.
+
+```rust
+pub trait IsFileReadWrite {
+    fn is_file_read_write(&self) -> io::Result<(bool, bool)>;
+}
+```
+
+```rust
+use cap_fs_ext::IsFileReadWrite;
+use cap_std::{ambient_authority, fs::{Dir, OpenOptions}};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+let mut opts = OpenOptions::new();
+opts.read(true).write(true).create(true);
+let file = dir.open_with("data.bin", &opts)?;
+
+let (readable, writable) = file.is_file_read_write()?;
+assert!(readable && writable);
+```
+
+---
+
+### `Reopen`
+
+Re-opens an existing file handle, producing a new independent `File` with potentially different access flags. This can be used to, for example, obtain a read handle from a write-only handle (subject to the original handle's permissions).
+
+```rust
+pub trait Reopen {
+    fn reopen(&self, options: &OpenOptions) -> io::Result<Self> where Self: Sized;
+}
+```
+
+<Warning>
+  `reopen` is not supported on all operating systems in all circumstances. It
+  works reliably on Linux and Windows for non-deleted files, and somewhat
+  reliably on macOS. On platforms without OS-specific support it returns
+  `io::ErrorKind::Other`. It cannot acquire permissions the original handle does
+  not already have.
+</Warning>
+
+```rust
+use cap_fs_ext::Reopen;
+use cap_std::{ambient_authority, fs::{Dir, OpenOptions}};
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+// Open write-only first, then reopen for reading:
+let write_file = dir.open_with("output.txt", OpenOptions::new().write(true).create(true))?;
+
+let read_opts = OpenOptions::new().read(true).to_owned();
+let read_file = write_file.reopen(&read_opts)?;
+```
+
+---
+
+### `FileTypeExt`
+
+Extends `cap_primitives::fs::FileType` (and `std::fs::FileType`) with Unix-style special-file predicates, available cross-platform.
+
+```rust
+pub trait FileTypeExt {
+    fn is_block_device(&self) -> bool;
+    fn is_char_device(&self) -> bool;
+    fn is_fifo(&self) -> bool;
+    fn is_socket(&self) -> bool;
+}
+```
+
+```rust
+use cap_fs_ext::FileTypeExt;
+use cap_std::{ambient_authority, fs::Dir};
+
+let dir = Dir::open_ambient_dir("/dev", ambient_authority())?;
+let ft = dir.metadata("null")?.file_type();
+
+if ft.is_char_device() {
+    println!("/dev/null is a character device");
+}
+```

@@ -1,0 +1,197 @@
+---
+title: "cap_std::time — Capability-Based Clock API"
+sidebarTitle: "Time"
+description: "Reference for cap_std::time: SystemClock, MonotonicClock, and capability-based access to wall-clock and monotonic time in cap-std."
+---
+
+The `cap_std::time` module is a capability-based replacement for `std::time`. In the standard library, time is an ambient resource — any code anywhere can call `std::time::SystemTime::now()` or `std::time::Instant::now()` without holding any particular value or permission. In `cap_std`, reading the clock requires a [`SystemClock`](#systemclock) or [`MonotonicClock`](#monotonicclock) instance, which must be explicitly constructed with [`AmbientAuthority`](/core/ambient-authority) and then passed to the parts of the program that need time access. This makes clock access an auditable, grantable capability rather than an invisible global.
+
+## Contrast with `std::time`
+
+```rust
+// std::time — ambient authority, callable from anywhere
+let now = std::time::SystemTime::now(); // no capability needed
+
+// cap_std::time — capability required
+use cap_std::{ambient_authority, time::SystemClock};
+let clock = SystemClock::new(ambient_authority());
+let now = clock.now(); // must hold the clock
+```
+
+This distinction matters for testing (you can inject a mock clock), for auditing (search for `SystemClock::new` to find all clock-access sites), and for sandboxed environments where untrusted code should not be able to observe wall-clock time.
+
+---
+
+## SystemClock
+
+`SystemClock` represents the system's wall-clock time. Its methods correspond to the methods that `std::time::SystemTime` provides as static/class methods in the standard library.
+
+```rust
+use cap_std::{ambient_authority, time::SystemClock};
+
+let clock = SystemClock::new(ambient_authority());
+let now = clock.now();
+println!("Current time: {:?}", now);
+
+// Measure elapsed wall-clock time
+let start = clock.now();
+// ... do work ...
+let elapsed = clock.elapsed(start)?;
+println!("Elapsed: {:.3}s", elapsed.as_secs_f64());
+# Ok::<(), std::time::SystemTimeError>(())
+```
+
+### `SystemClock::new`
+```rust
+pub const fn new(ambient_authority: AmbientAuthority) -> Self
+```
+Constructs a new `SystemClock`. Requires `AmbientAuthority` because reading wall-clock time is an ambient capability. This is a `const fn`, so you can store a `SystemClock` in a `static` if needed.
+
+### `SystemClock::now`
+```rust
+pub fn now(&self) -> SystemTime
+```
+Returns a `SystemTime` representing the current moment. Corresponds to `std::time::SystemTime::now`.
+
+### `SystemClock::elapsed`
+```rust
+pub fn elapsed(&self, system_time: SystemTime) -> Result<Duration, SystemTimeError>
+```
+Returns the `Duration` elapsed since `system_time`. Returns `Err(SystemTimeError)` if the current time is earlier than `system_time` (which can happen with clock adjustments). Corresponds to `std::time::SystemTime::elapsed`.
+
+### `SystemClock::UNIX_EPOCH`
+```rust
+pub const UNIX_EPOCH: SystemTime
+```
+An anchor in time equivalent to `std::time::SystemTime::UNIX_EPOCH`. Use this as a reference point for computing timestamps:
+
+```rust
+let ts = clock.now()
+    .duration_since(SystemClock::UNIX_EPOCH)?;
+println!("Unix timestamp: {}", ts.as_secs());
+# Ok::<(), std::time::SystemTimeError>(())
+```
+
+---
+
+## MonotonicClock
+
+`MonotonicClock` represents a monotonically non-decreasing clock. Unlike `SystemClock`, its values cannot jump backwards due to NTP adjustments or manual clock changes, making it suitable for measuring elapsed time in performance-sensitive code. Its methods correspond to the instance methods of `std::time::Instant`.
+
+```rust
+use cap_std::{ambient_authority, time::MonotonicClock};
+
+let clock = MonotonicClock::new(ambient_authority());
+let start = clock.now();
+
+// ... do work ...
+
+let elapsed = clock.elapsed(start);
+println!("Took {:?}", elapsed);
+```
+
+### `MonotonicClock::new`
+```rust
+pub const fn new(ambient_authority: AmbientAuthority) -> Self
+```
+Constructs a new `MonotonicClock`. Like `SystemClock::new`, this is `const` and requires `AmbientAuthority`.
+
+### `MonotonicClock::now`
+```rust
+pub fn now(&self) -> Instant
+```
+Returns an `Instant` representing the current monotonic time. Corresponds to `std::time::Instant::now`.
+
+### `MonotonicClock::elapsed`
+```rust
+pub fn elapsed(&self, instant: Instant) -> Duration
+```
+Returns the `Duration` elapsed since `instant`. This never returns an error because a monotonic clock never goes backwards. Corresponds to `std::time::Instant::elapsed`.
+
+---
+
+## Re-exported types
+
+`cap_std::time` re-exports the following types from `std::time` (and `cap_primitives`) unchanged. They work exactly as their `std` counterparts:
+
+| Type | Source | Description |
+|------|--------|-------------|
+| `Duration` | `std::time::Duration` | A span of time (seconds + nanoseconds) |
+| `Instant` | `cap_primitives::time::Instant` | A monotonic point in time (wraps `std::time::Instant`) |
+| `SystemTime` | `cap_primitives::time::SystemTime` | A wall-clock point in time (wraps `std::time::SystemTime`) |
+| `SystemTimeError` | `std::time::SystemTimeError` | Error from comparing `SystemTime` values |
+
+---
+
+## Choosing between the two clocks
+
+| Use case | Use |
+|----------|-----|
+| Measuring elapsed time, timeouts, benchmarks | `MonotonicClock` |
+| Recording timestamps, file modification times | `SystemClock` |
+| Scheduling at a specific wall-clock time | `SystemClock` |
+| Preventing untrusted code from observing the date | Neither (don't pass a clock) |
+
+---
+
+## Storing a clock in a struct
+
+Because `SystemClock` and `MonotonicClock` are both zero-sized structs, embedding them in your application state costs nothing at runtime:
+
+```rust
+use cap_std::time::{MonotonicClock, SystemClock};
+
+struct AppMetrics {
+    wall_clock: SystemClock,
+    mono_clock: MonotonicClock,
+}
+
+impl AppMetrics {
+    pub fn new(wall_clock: SystemClock, mono_clock: MonotonicClock) -> Self {
+        Self { wall_clock, mono_clock }
+    }
+
+    pub fn record_event(&self, name: &str) {
+        let ts = self.wall_clock.now();
+        println!("[{:?}] Event: {}", ts, name);
+    }
+}
+```
+
+---
+
+## Complete example
+
+```rust
+use cap_std::{
+    ambient_authority,
+    time::{MonotonicClock, SystemClock, SystemTime},
+};
+use std::time::Duration;
+
+fn main() {
+    let aa = ambient_authority();
+    let wall = SystemClock::new(aa);
+    let mono = MonotonicClock::new(aa);
+
+    // Print the current Unix timestamp
+    let now: SystemTime = wall.now();
+    let since_epoch = now
+        .duration_since(SystemClock::UNIX_EPOCH)
+        .expect("clock is before epoch");
+    println!("Unix time: {}s", since_epoch.as_secs());
+
+    // Time a loop with the monotonic clock
+    let start = mono.now();
+    let mut sum = 0u64;
+    for i in 0..1_000_000 {
+        sum += i;
+    }
+    let elapsed: Duration = mono.elapsed(start);
+    println!("Sum: {sum}, took {:?}", elapsed);
+}
+```
+
+<Tip>
+  For additional time features beyond what `std` provides — such as getting file times with nanosecond precision, converting between `Instant` and `SystemTime`, or sleeping with a capability — see the [`cap-time-ext`](https://docs.rs/cap-time-ext) crate.
+</Tip>

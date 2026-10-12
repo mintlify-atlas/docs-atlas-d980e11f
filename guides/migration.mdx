@@ -1,0 +1,346 @@
+---
+title: "Migrating from std::fs to cap-std"
+sidebarTitle: "Migration"
+description: "Step-by-step guide to replacing std::fs and std::net calls with their cap-std equivalents for capability-based filesystem and network access."
+---
+
+Migrating from `std::fs` to `cap-std` is largely a mechanical process: most standard library functions have a direct `Dir` method equivalent. The key structural change is that you stop passing path strings through your call stack and start passing `Dir` handles instead. This section walks through the migration step-by-step, showing before-and-after pairs for the most common operations.
+
+<Tip>
+Before you start, search your codebase for `std::fs::`, `std::net::TcpStream`, and `use std::fs` to enumerate every call site that needs updating. In most editors and IDEs, a project-wide search for `std::fs` is the fastest way to build your migration checklist.
+</Tip>
+
+## Step 1 — Add cap-std to Cargo.toml
+
+```toml
+[dependencies]
+cap-std = "4"
+```
+
+If you want UTF-8 paths throughout, also enable the `fs_utf8` feature:
+
+```toml
+[dependencies]
+cap-std = { version = "4", features = ["fs_utf8"] }
+```
+
+## Step 2 — Obtain Your First Dir
+
+Every cap-std program needs to acquire its initial `Dir` at the entry point. There are three common approaches:
+
+<Steps>
+  <Step title="Open an existing directory (ambient authority)">
+    Use `Dir::open_ambient_dir` when you know the path upfront. This is the only call that uses ambient authority; wrap it in `main` or your initialization code.
+
+    ```rust
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+
+    fn main() -> std::io::Result<()> {
+        let dir = Dir::open_ambient_dir("./data", ambient_authority())?;
+        // Pass `dir` into your application logic.
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Use cap-directories for application data">
+    For config, cache, or data directories that follow OS conventions, use the `cap-directories` crate:
+
+    ```toml
+    [dependencies]
+    cap-directories = "4"
+    ```
+
+    ```rust
+    use cap_directories::{ambient_authority, ProjectDirs};
+
+    fn main() -> anyhow::Result<()> {
+        let project_dirs = ProjectDirs::from(
+            "com.example", "Example Org", "My App",
+            ambient_authority(),
+        )
+        .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+
+        let data_dir = project_dirs.data_dir()?;
+        // data_dir is a fully sandboxed cap_std::fs::Dir.
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Use cap-tempfile for temporary directories">
+    For tests or scratch space, use the `cap-tempfile` crate:
+
+    ```toml
+    [dependencies]
+    cap-tempfile = "4"
+    ```
+
+    ```rust
+    use cap_tempfile::ambient_authority;
+
+    fn main() -> std::io::Result<()> {
+        let tmp = cap_tempfile::tempdir(ambient_authority())?;
+        let dir = tmp.open_dir(".")?;
+        // Use dir, then tmp is cleaned up on drop.
+        Ok(())
+    }
+    ```
+  </Step>
+</Steps>
+
+## Step 3 — Migrate File Operations
+
+<Tabs>
+  <Tab title="Before (std::fs)">
+    ```rust
+    use std::fs;
+
+    // Open a file for reading
+    let file = fs::File::open("data/config.toml")?;
+
+    // Create / open for writing
+    let file = fs::File::create("output/result.json")?;
+
+    // Read entire file to bytes
+    let bytes = fs::read("data/payload.bin")?;
+
+    // Read entire file to string
+    let text = fs::read_to_string("data/config.toml")?;
+
+    // Write bytes to file
+    fs::write("output/result.txt", b"hello")?;
+
+    // Get metadata
+    let meta = fs::metadata("data/config.toml")?;
+
+    // Remove a file
+    fs::remove_file("output/old.txt")?;
+
+    // Copy a file
+    fs::copy("src/logo.png", "dst/logo.png")?;
+    ```
+  </Tab>
+  <Tab title="After (cap-std)">
+    ```rust
+    use cap_std::fs::Dir;
+
+    // `dir` was obtained at the entry point and passed in.
+
+    // Open a file for reading
+    let file = dir.open("data/config.toml")?;
+
+    // Create / open for writing
+    let file = dir.create("output/result.json")?;
+
+    // Read entire file to bytes
+    let bytes = dir.read("data/payload.bin")?;
+
+    // Read entire file to string
+    let text = dir.read_to_string("data/config.toml")?;
+
+    // Write bytes to file
+    dir.write("output/result.txt", b"hello")?;
+
+    // Get metadata
+    let meta = dir.metadata("data/config.toml")?;
+
+    // Remove a file
+    dir.remove_file("output/old.txt")?;
+
+    // Copy a file (both paths relative to their respective Dirs)
+    dir.copy("src/logo.png", &dir, "dst/logo.png")?;
+    ```
+  </Tab>
+</Tabs>
+
+## Step 4 — Migrate Directory Operations
+
+<Tabs>
+  <Tab title="Before (std::fs)">
+    ```rust
+    use std::fs;
+
+    // Create a directory
+    fs::create_dir("output/reports")?;
+
+    // Create directory and all parents
+    fs::create_dir_all("output/reports/2024/q1")?;
+
+    // Read directory entries
+    for entry in fs::read_dir("data")? {
+        let entry = entry?;
+        println!("{:?}", entry.file_name());
+    }
+
+    // Remove an empty directory
+    fs::remove_dir("output/old")?;
+
+    // Remove directory and all contents
+    fs::remove_dir_all("output/temp")?;
+
+    // Canonicalize a path
+    let canonical = fs::canonicalize("data/../data/config.toml")?;
+
+    // Rename / move
+    fs::rename("output/draft.txt", "output/final.txt")?;
+    ```
+  </Tab>
+  <Tab title="After (cap-std)">
+    ```rust
+    use cap_std::fs::Dir;
+
+    // `dir` was obtained at the entry point and passed in.
+
+    // Create a directory
+    dir.create_dir("output/reports")?;
+
+    // Create directory and all parents
+    dir.create_dir_all("output/reports/2024/q1")?;
+
+    // Read directory entries
+    for entry in dir.read_dir("data")? {
+        let entry = entry?;
+        println!("{:?}", entry.file_name());
+    }
+
+    // Remove an empty directory
+    dir.remove_dir("output/old")?;
+
+    // Remove directory and all contents
+    dir.remove_dir_all("output/temp")?;
+
+    // Canonicalize returns a *relative* path (absolute paths don't
+    // compose with the capability model).
+    let canonical = dir.canonicalize("data/../data/config.toml")?;
+
+    // Rename / move (both paths relative to their respective Dirs)
+    dir.rename("output/draft.txt", &dir, "output/final.txt")?;
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+`Dir::canonicalize` returns a **relative** `PathBuf`, not an absolute one. This is intentional: absolute paths don't compose well with the capability model, and returning a relative path keeps everything scoped to the `Dir`.
+</Note>
+
+## Step 5 — Migrate OpenOptions
+
+<Tabs>
+  <Tab title="Before (std::fs)">
+    ```rust
+    use std::fs::OpenOptions;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open("data/log.txt")?;
+    ```
+  </Tab>
+  <Tab title="After (cap-std)">
+    ```rust
+    use cap_std::fs::{Dir, OpenOptions};
+
+    // OpenOptions is constructed the same way; pass it to `dir.open_with`.
+    let file = dir.open_with(
+        "data/log.txt",
+        OpenOptions::new().read(true).write(true).create(true),
+    )?;
+    ```
+  </Tab>
+</Tabs>
+
+## Step 6 — Migrate Networking
+
+cap-std's `Pool` type plays the same role for network access as `Dir` does for the filesystem. Construct a `Pool` at startup with all the addresses your program needs, then pass it down to functions.
+
+<Tabs>
+  <Tab title="Before (std::net)">
+    ```rust
+    use std::net::{TcpStream, TcpListener, UdpSocket};
+
+    // Connect to any address
+    let stream = TcpStream::connect("api.example.com:443")?;
+
+    // Bind a listener
+    let listener = TcpListener::bind("0.0.0.0:8080")?;
+
+    // UDP socket
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("dns.example.com:53")?;
+    ```
+  </Tab>
+  <Tab title="After (cap-std)">
+    ```rust
+    use cap_std::net::Pool;
+    use cap_std::ambient_authority;
+
+    // Build the pool at startup (ambient authority used once here).
+    let mut pool = Pool::new();
+    pool.insert_tcp("api.example.com", 443..=443, ambient_authority())?;
+    pool.insert_tcp("0.0.0.0", 8080..=8080, ambient_authority())?;
+    pool.insert_udp("dns.example.com", 53..=53, ambient_authority())?;
+
+    // Pass the pool into your functions.
+    use_network(&pool)?;
+
+    fn use_network(pool: &Pool) -> std::io::Result<()> {
+        // Connect — succeeds only if the address is in the pool.
+        let stream = pool.connect_tcp_stream("api.example.com:443")?;
+
+        // Bind a listener
+        let listener = pool.bind_tcp_listener("0.0.0.0:8080")?;
+
+        // UDP socket
+        let socket = pool.bind_udp_socket("0.0.0.0:0")?;
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Quick Reference Table
+
+| `std` API | cap-std equivalent |
+|---|---|
+| `File::open(path)` | `dir.open(path)` |
+| `File::create(path)` | `dir.create(path)` |
+| `OpenOptions::new().open(path)` | `dir.open_with(path, &opts)` |
+| `fs::read(path)` | `dir.read(path)` |
+| `fs::read_to_string(path)` | `dir.read_to_string(path)` |
+| `fs::write(path, data)` | `dir.write(path, data)` |
+| `fs::metadata(path)` | `dir.metadata(path)` |
+| `fs::create_dir(path)` | `dir.create_dir(path)` |
+| `fs::create_dir_all(path)` | `dir.create_dir_all(path)` |
+| `fs::read_dir(path)` | `dir.read_dir(path)` |
+| `fs::remove_file(path)` | `dir.remove_file(path)` |
+| `fs::remove_dir(path)` | `dir.remove_dir(path)` |
+| `fs::remove_dir_all(path)` | `dir.remove_dir_all(path)` |
+| `fs::rename(from, to)` | `dir.rename(from, &dir, to)` |
+| `fs::copy(from, to)` | `dir.copy(from, &dir, to)` |
+| `fs::canonicalize(path)` | `dir.canonicalize(path)` *(returns relative path)* |
+| `fs::symlink_metadata(path)` | `dir.symlink_metadata(path)` |
+| `fs::set_permissions(path, p)` | `dir.set_permissions(path, p)` |
+| `TcpStream::connect(addr)` | `pool.connect_tcp_stream(addr)` |
+| `TcpListener::bind(addr)` | `pool.bind_tcp_listener(addr)` |
+| `UdpSocket::bind(addr)` | `pool.bind_udp_socket(addr)` |
+
+## Updating Function Signatures
+
+As you migrate call sites, update function signatures to accept `&Dir` instead of path strings. This is the step that makes the migration worthwhile—it shifts the expression of intent from comments or documentation into the type system.
+
+```rust
+// Before: the function could open any path on the system.
+fn load_config(config_path: &str) -> anyhow::Result<Config> {
+    let text = std::fs::read_to_string(config_path)?;
+    Ok(toml::from_str(&text)?)
+}
+
+// After: the function can only read from the directory it's given.
+fn load_config(config_dir: &cap_std::fs::Dir, filename: &str) -> anyhow::Result<Config> {
+    let text = config_dir.read_to_string(filename)?;
+    Ok(toml::from_str(&text)?)
+}
+```

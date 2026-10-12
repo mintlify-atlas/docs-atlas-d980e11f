@@ -1,0 +1,106 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "cap-std",
+  "projectDescription": "A capability-based version of the Rust standard library that sandboxes filesystem, networking, and time access using unforgeable resource handles instead of ambient authority.",
+  "theme": "luma",
+  "primaryColor": "#469eab",
+  "lightColor": "#1dd3d9",
+  "darkColor": "#5c94e9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Core Crate",
+            "pages": [
+              "core/filesystem",
+              "core/networking",
+              "core/time",
+              "core/ambient-authority"
+            ]
+          },
+          {
+            "group": "Extension Crates",
+            "pages": [
+              "extensions/cap-fs-ext",
+              "extensions/cap-net-ext",
+              "extensions/cap-time-ext",
+              "extensions/cap-directories",
+              "extensions/cap-tempfile",
+              "extensions/cap-rand"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/sandboxing",
+              "guides/migration",
+              "guides/wasi",
+              "guides/utf8-paths"
+            ]
+          },
+          {
+            "group": "Project",
+            "pages": [
+              "project/platform-support",
+              "project/security",
+              "project/contributing"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Capability-based filesystem sandboxing via the Dir type — all file access is relative to an open directory handle",
+    "Path traversal protection (CWE-22): blocks '..', absolute paths, and symlinks that escape the sandbox",
+    "Capability-based networking via the Pool type — connections only to explicitly permitted addresses",
+    "Drop-in std-like API: mirrors std::fs, std::net, and std::time with capability wrappers",
+    "High-performance: uses openat2 on Linux 5.6+, O_RESOLVE_BENEATH on FreeBSD 13.0+",
+    "UTF-8 path support via cap_std::fs_utf8 and the camino crate",
+    "Extension traits (cap-fs-ext, cap-net-ext, cap-time-ext) for advanced operations beyond std",
+    "Foundation of the WASI implementation in Wasmtime",
+    "Cross-platform: Linux, macOS, FreeBSD, Windows, and WASI"
+  ],
+  "publicApiSurface": [
+    "cap_std::fs::Dir",
+    "cap_std::fs::File",
+    "cap_std::fs::ReadDir",
+    "cap_std::fs::DirEntry",
+    "cap_std::fs::OpenOptions",
+    "cap_std::fs::Metadata",
+    "cap_std::fs::Permissions",
+    "cap_std::fs_utf8::Dir (feature: fs_utf8)",
+    "cap_std::net::Pool",
+    "cap_std::net::TcpListener",
+    "cap_std::net::TcpStream",
+    "cap_std::net::UdpSocket",
+    "cap_std::time::SystemClock",
+    "cap_std::time::MonotonicClock",
+    "cap_std::ambient_authority()",
+    "cap_std::AmbientAuthority",
+    "cap_fs_ext::DirExt",
+    "cap_fs_ext::DirEntryExt",
+    "cap_fs_ext::MetadataExt",
+    "cap_fs_ext::OpenOptionsFollowExt",
+    "cap_fs_ext::OpenOptionsSyncExt",
+    "cap_fs_ext::Reopen",
+    "cap_net_ext::PoolExt",
+    "cap_time_ext::SystemClockExt",
+    "cap_time_ext::MonotonicClockExt",
+    "cap_directories::ProjectDirs",
+    "cap_directories::UserDirs",
+    "cap_tempfile::TempDir",
+    "cap_rand::rngs::OsRng",
+    "cap_rand::rngs::CapRng"
+  ]
+}

@@ -1,0 +1,147 @@
+---
+title: "cap-std on WASI: WebAssembly System Interface"
+sidebarTitle: "WASI"
+description: "How cap-std's capability-based API aligns with WASI's sandboxing model, its role in Wasmtime, and what to expect when targeting wasm32-wasi."
+---
+
+The WebAssembly System Interface (WASI) is built on the same capability-based principles as cap-std: every system call requires an explicit handle (a *capability*), not ambient access to the host filesystem. Because cap-std's API was designed with exactly this model in mind, the two fit together naturally—so naturally, in fact, that cap-std became the foundation for the WASI implementation inside [Wasmtime](https://wasmtime.dev/), the leading WebAssembly runtime from the Bytecode Alliance.
+
+## How cap-std Aligns with WASI
+
+WASI's filesystem model is centered on *preopened directories*: the host runtime grants a WebAssembly module access to specific directories at startup, and all subsequent filesystem operations must be relative to those handles. This is structurally identical to cap-std's `Dir` model, where every file operation is scoped to an open directory handle.
+
+The alignment goes deeper than the API surface:
+
+- **No absolute paths.** WASI rejects absolute paths in system calls; cap-std uses `RESOLVE_BENEATH` semantics and also rejects absolute paths. Code written to cap-std's API naturally produces correct WASI behavior.
+- **No `..` escapes.** Both WASI and cap-std block path components that would walk above the granted directory handle.
+- **Symlink safety.** Both enforce that symlinks cannot lead outside the granted directory.
+
+This means code that is correct with cap-std on Linux or macOS is also correct under WASI's constraints—the invariants are the same.
+
+## cap-std as Wasmtime's WASI Implementation
+
+Wasmtime uses cap-std internally to implement the WASI filesystem interface. When a Wasm module makes a WASI `fd_read` or `path_open` call, Wasmtime translates it into cap-std operations. This gives Wasmtime portable, audited, capability-enforcing filesystem access across Linux, macOS, FreeBSD, and Windows—without reimplementing sandboxing logic from scratch.
+
+For Wasm module authors, this means:
+
+- Security invariants from cap-std (path traversal protection, symlink checks) are enforced by the runtime, not just requested.
+- The same runtime behavior is available whether you're running native Rust with cap-std or compiled Wasm under Wasmtime.
+
+<Info>
+WASI support in cap-std is under active development. The `cap_std::fs` and `cap_std::time` modules are available on `wasm32-wasi`, but the networking module (`cap_std::net`) is currently disabled on that target. Check the [cap-std repository](https://github.com/bytecodealliance/cap-std) for the latest status.
+</Info>
+
+## A Thinner Layer on WASI
+
+On native platforms (Linux, macOS, Windows), `std::fs` has to work around the OS's ambient-authority model: it needs extra code to handle absolute paths, to normalize paths, and to protect against TOCTOU races. cap-std adds another layer on top to enforce capability semantics.
+
+On WASI, the situation is different. The host runtime already enforces capability semantics at the system-call level, so cap-std can pass operations through much more directly—it becomes a **thinner** layer than even `libstd` on native platforms.
+
+```
+Native:   [cap-std] → [std (ambient authority shims)] → [OS syscalls]
+WASI:     [cap-std] → [WASI syscalls (already capability-scoped)]
+```
+
+This means cap-std on WASI is both simpler and more efficient than on native platforms: there's less code between your application and the underlying capability boundary.
+
+## The `wasi_ext` Feature
+
+<Note>
+The `wasi_ext` feature enables WASI-specific filesystem extensions available through `cap_std::os::wasi::fs::OpenOptionsExt`. These correspond to WASI's `oflags` and `fs_rights` fields in `path_open`, providing access to capabilities not expressible through the standard `OpenOptions` API.
+</Note>
+
+To use WASI filesystem extensions in your cap-std code:
+
+```toml
+[dependencies]
+cap-std = "4"
+```
+
+Then, inside a `#[cfg(target_os = "wasi")]` block:
+
+```rust
+#[cfg(target_os = "wasi")]
+use cap_std::os::wasi::fs::OpenOptionsExt;
+
+fn open_with_wasi_flags(dir: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::File> {
+    #[cfg(target_os = "wasi")]
+    {
+        use cap_std::fs::OpenOptions;
+        dir.open_with(
+            "data.bin",
+            OpenOptions::new().read(true).write(true),
+        )
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        dir.open("data.bin")
+    }
+}
+```
+
+## Building for `wasm32-wasi`
+
+Compiling a cap-std program for WASI follows the same process as any Rust program targeting WebAssembly:
+
+```bash
+# Install the WASI target
+rustup target add wasm32-wasip1
+
+# Build your crate
+cargo build --target wasm32-wasip1
+```
+
+<Note>
+The WASI target triple changed from `wasm32-wasi` to `wasm32-wasip1` in Rust 1.78, corresponding to WASI Preview 1. Use the triple that matches your installed Rust toolchain.
+</Note>
+
+Once compiled, run your module with Wasmtime and grant it access to specific directories using `--dir`:
+
+```bash
+# Grant the module access to ./data only.
+wasmtime run --dir ./data my_program.wasm
+```
+
+Any attempt by the Wasm module to access paths outside `./data` will be rejected by Wasmtime's WASI implementation—the same enforcement that cap-std provides natively, but now at the runtime boundary.
+
+## What Is Disabled on WASI
+
+Some cap-std features are not yet available when targeting WASI:
+
+| Feature | Native | WASI |
+|---|---|---|
+| `cap_std::fs` | ✅ | ✅ (in development) |
+| `cap_std::time` | ✅ | ✅ |
+| `cap_std::net` | ✅ | ❌ disabled |
+| `set_permissions` | ✅ | ❌ (no WASI equivalent) |
+| Unix sockets | ✅ (Unix only) | ❌ |
+
+The `cap_std::net::Pool` type and all networking APIs (`connect_tcp_stream`, `bind_tcp_listener`, etc.) are compiled out on `wasm32-wasi`. This reflects the current state of WASI's networking support, which is still being standardized through the WASI sockets proposal.
+
+## Writing Portable cap-std Code
+
+To write code that compiles and runs correctly on both native targets and WASI, use `#[cfg]` guards for platform-specific features:
+
+```rust
+use cap_std::fs::Dir;
+
+fn app_logic(dir: &Dir) -> std::io::Result<()> {
+    // Filesystem operations work on all platforms.
+    dir.create_dir_all("output")?;
+    dir.write("output/result.txt", b"done")?;
+
+    // Network operations are guarded for WASI.
+    #[cfg(not(target_os = "wasi"))]
+    {
+        use cap_std::net::Pool;
+        use cap_std::ambient_authority;
+        let mut pool = Pool::new();
+        pool.insert_tcp("api.example.com", 443..=443, ambient_authority())?;
+        let _stream = pool.connect_tcp_stream("api.example.com:443")?;
+    }
+
+    Ok(())
+}
+```
+
+This pattern lets the same codebase serve both native deployments (with full networking) and WASI deployments (filesystem-only, sandboxed by the runtime).

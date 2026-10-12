@@ -1,0 +1,124 @@
+---
+title: "cap-std: Capability-Based Version of the Rust stdlib"
+sidebarTitle: "Introduction"
+description: "cap-std replaces std::fs and std::net with sandboxed, capability-based APIs that prevent path traversal attacks and enforce fine-grained access control."
+---
+
+`cap-std` is a capability-based reimplementation of the Rust standard library's filesystem and networking APIs. Instead of granting programs the ambient authority to open any file by absolute path, `cap-std` requires code to operate through unforgeable resource handles — so a function that receives a `Dir` can only ever access files beneath that directory, and a function that receives a `Pool` can only connect to network addresses explicitly added to it. This makes security properties legible in function signatures rather than buried in runtime access-control lists configured outside the application.
+
+## Ambient authority vs. capability-based security
+
+Standard Rust programs operate with *ambient authority*: any code running in the process can open `/etc/passwd`, connect to any IP address, or read the current working directory without any explicit grant of permission.
+
+```rust
+// std::fs — ambient authority: opens any path the process can access
+use std::fs::File;
+let file = File::open("/etc/passwd")?;
+```
+
+`cap-std` eliminates ambient authority from filesystem and networking operations. To open a file, you must already hold a `Dir` that contains it:
+
+```rust
+// cap-std — capability-based: only paths beneath `dir` are reachable
+use cap_std::fs::Dir;
+
+fn read_config(dir: &Dir) -> std::io::Result<cap_std::fs::File> {
+    dir.open("config.toml") // succeeds only if config.toml is inside dir
+}
+```
+
+Any attempt to escape the sandbox fails at the API level:
+
+```rust
+// Both of these return `PermissionDenied`:
+let hidden = dir.open("../hidden.txt")?;
+
+// Creating symlinks to absolute paths is also blocked:
+dir.symlink("/hidden.txt", "misdirection.txt")?;
+
+// Even a pre-existing symlink that leads outside the Dir is blocked:
+let secret = dir.open("misdirection.txt")?;
+```
+
+## Key types
+
+### `Dir`
+
+`Dir` represents an open directory on the filesystem. It mirrors the free functions in `std::fs` — `open`, `create_dir`, `read_dir`, `rename`, `remove_file`, and so on — but every operation takes a path *relative to the `Dir`*. Absolute paths and `..` components that escape the root are rejected with a `PermissionDenied` error.
+
+```rust
+use cap_std::fs::Dir;
+use cap_std::ambient_authority;
+
+// Obtain the first Dir using ambient authority (documented intent)
+let dir = Dir::open_ambient_dir("my_app_data", ambient_authority())?;
+
+// All subsequent operations are sandboxed
+let file   = dir.open("settings.json")?;
+let subdir = dir.open_dir("cache")?;
+dir.create_dir("logs")?;
+dir.write("output.txt", b"hello")?;
+```
+
+`Dir` wraps a raw file descriptor internally, so it has zero overhead compared to the underlying OS `openat`-family calls. On Linux 5.6+ it uses [`openat2`](https://lwn.net/Articles/796868/) for single-syscall resolution; on FreeBSD 13+ it uses `openat(O_RESOLVE_BENEATH)`.
+
+### `Pool`
+
+`Pool` is the networking counterpart to `Dir`. It holds a set of permitted IP addresses and ports. Network operations — `bind_tcp_listener`, `connect_tcp_stream`, `bind_udp_socket` — succeed only when the target address matches an entry in the pool.
+
+```rust
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+
+let mut pool = Pool::new();
+pool.insert("localhost:3333", ambient_authority())?;
+
+// Connects only because localhost:3333 was explicitly added above
+let stream = pool.connect_tcp_stream("localhost:3333")?;
+
+// Any address not in the pool returns PermissionDenied
+let blocked = pool.connect_tcp_stream("example.com:80")?;
+```
+
+## What cap-std protects against
+
+`cap-std` directly addresses [CWE-22](https://cwe.mitre.org/data/definitions/22.html), **Improper Limitation of a Pathname to a Restricted Directory ("Path Traversal")**, which ranks in the [2021 CWE Top 25 Most Dangerous Software Weaknesses](https://cwe.mitre.org/top25/archive/2021/2021_cwe_top25.html). Specifically, it blocks:
+
+- **`..` traversal** — paths like `../../etc/passwd` are rejected before any syscall is made.
+- **Absolute path escapes** — paths beginning with `/` are an error inside a `Dir`.
+- **Symlink escapes** — symlinks that would resolve outside the `Dir` boundary are detected and blocked, even if the symlink was created by a different process.
+- **`/proc/self/mem` injection** (Linux) — cap-std verifies that `/proc` is actually `procfs` with nothing mounted on top before using it internally.
+
+<Note>
+`cap-std` is not a sandbox for *untrusted Rust code*. Unsafe code can still call `std::fs` directly or use raw syscalls. `cap-std` lets trustworthy code declare its intent and protect itself from *malicious path inputs* — it is not a substitute for process-level isolation.
+</Note>
+
+## The crate family
+
+The `cap-std` project is a [Bytecode Alliance](https://bytecodealliance.org/) project consisting of several related crates:
+
+| Crate | Purpose |
+|---|---|
+| `cap-std` | Core crate — `fs::Dir`, `net::Pool`, `time` |
+| `cap-primitives` | Low-level platform primitives used by the other crates |
+| `cap-fs-ext` | Extra filesystem operations beyond `std::fs` |
+| `cap-net-ext` | Extra networking operations and binder/connecter helpers |
+| `cap-directories` | Capability-based access to standard app data directories |
+| `cap-tempfile` | Capability-based temporary file and directory creation |
+| `cap-rand` | Capability-based access to random number generators |
+| `cap-time-ext` | Extra time APIs beyond `std::time` |
+
+There is also a community-maintained [`cap-std-ext`](https://crates.io/crates/cap-std-ext) crate that adds atomic create/replace operations and file-descriptor passing to child processes.
+
+cap-std is the foundation for the [WASI](https://github.com/WebAssembly/WASI/) implementation in [Wasmtime](https://wasmtime.dev/), providing cross-platform sandboxing on Linux, macOS, Windows, and FreeBSD.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Add cap-std to your project, open a sandboxed directory, and write your first capability-based code in minutes.
+  </Card>
+  <Card title="Concepts" icon="book-open" href="/concepts">
+    Deep-dive into capability-based security, how Dir and Pool work, AmbientAuthority, and what cap-std cannot protect against.
+  </Card>
+</CardGroup>

@@ -1,0 +1,175 @@
+---
+title: "Contributing to cap-std"
+sidebarTitle: "Contributing"
+description: "How to contribute to cap-std: development setup, running tests, fuzzing, benchmarking, code of conduct, and the Bytecode Alliance membership context."
+---
+
+cap-std is an open-source [Bytecode Alliance](https://bytecodealliance.org/) project, and contributions of all kinds are welcome — bug reports, documentation improvements, new features, platform ports, and fuzzing. Whether you are fixing a typo or implementing a new capability primitive, this guide will get you set up and pointed in the right direction.
+
+## Repository
+
+All development happens on GitHub:
+
+**[https://github.com/bytecodealliance/cap-std](https://github.com/bytecodealliance/cap-std)**
+
+The repository is a Cargo workspace containing the following member crates:
+
+```
+cap-std/
+├── cap-std/          # Core capability-based std APIs
+├── cap-primitives/   # Low-level platform primitives
+├── cap-fs-ext/       # Extended filesystem APIs
+├── cap-net-ext/      # Extended network APIs
+├── cap-directories/  # Access to standard app directories
+├── cap-tempfile/     # Capability-based temporary files
+├── cap-time-ext/     # Extended time APIs
+├── cap-rand/         # Capability-based random number generation
+├── fuzz/             # Fuzzing harness for cap-primitives
+├── benches/          # Micro-benchmarks
+└── examples/         # Usage examples (e.g., kv-cli)
+```
+
+## Development Environment Setup
+
+You need a working [Rust toolchain](https://rustup.rs/). The minimum supported Rust version for the workspace is **1.70**. A stable toolchain is sufficient for all tests; a nightly toolchain is needed only for benchmarks.
+
+```bash
+# Install Rust (if you haven't already)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone the repository
+git clone https://github.com/bytecodealliance/cap-std
+cd cap-std
+```
+
+cap-std uses [`rustfmt`](https://github.com/rust-lang/rustfmt#quick-start) for code formatting. Make sure your changes are formatted before opening a PR:
+
+```bash
+cargo fmt --all
+```
+
+## Running Tests
+
+```bash
+cargo test
+```
+
+This runs the full test suite across all workspace crates. You can also run tests for a single crate:
+
+```bash
+cargo test -p cap-std
+cargo test -p cap-primitives
+```
+
+To run with the `fs_utf8` feature enabled (UTF-8 path types via [`camino`](https://crates.io/crates/camino)):
+
+```bash
+cargo test --no-default-features --features=fs_utf8 --workspace
+```
+
+<Note>
+  The test suite exercises real filesystem operations. Tests are designed to be
+  safe to run in any working directory, but avoid running the fuzzer (see below)
+  in a directory containing important data.
+</Note>
+
+## Fuzzing
+
+cap-std includes a fuzzing harness for the `cap-primitives` crate. The fuzzer constructs random paths and attempts random filesystem operations on them, checking that the sandbox invariants hold under all circumstances.
+
+```bash
+# From the fuzz/ directory
+cargo fuzz run fuzz_target_1
+```
+
+<Warning>
+  The fuzzer performs real filesystem operations in the current working
+  directory. Run it in a dedicated, disposable location — a critical execution
+  path could result in **data loss**. See
+  [fuzz/README.md](https://github.com/bytecodealliance/cap-std/blob/main/fuzz/README.md)
+  for full details.
+</Warning>
+
+## Benchmarking
+
+cap-std includes several micro-benchmarks for the `cap-std` crate that stress-test specific API features, including `Dir::open` performance across the syscall fast paths and the manual fallback.
+
+```bash
+# Requires a nightly toolchain
+cargo +nightly bench
+```
+
+<Note>
+  These are micro-benchmarks and are not representative of real-world
+  workloads. They are primarily useful when working on the internals of
+  path resolution, syscall selection, or other performance-sensitive code
+  paths in `cap-primitives`.
+</Note>
+
+## Submitting Issues and Pull Requests
+
+cap-std follows standard GitHub pull-request–oriented development.
+
+**For bug reports:**
+- Search existing issues before opening a new one.
+- Include the platform (OS + kernel version), Rust version (`rustc --version`), and a minimal reproducible example.
+- For security vulnerabilities, **do not open a public issue** — see the [Security](./security) page instead.
+
+**For pull requests:**
+- Fork the repository and create a feature branch.
+- Ensure `cargo test --workspace` passes.
+- Ensure `cargo fmt --all -- --check` passes.
+- Write a clear PR description explaining the motivation and approach.
+- Reference any related issues.
+
+All PRs are reviewed by the maintainers. The project uses linear history; maintainers may ask you to rebase before merging.
+
+## License
+
+cap-std is licensed under a triple license, giving you the choice of:
+
+```toml
+license = "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+```
+
+| License | SPDX ID |
+|---|---|
+| Apache 2.0 with LLVM Exception | `Apache-2.0 WITH LLVM-exception` |
+| Apache 2.0 | `Apache-2.0` |
+| MIT | `MIT` |
+
+By submitting a contribution, you agree that your contribution will be licensed under these terms. License files are located at `LICENSE-Apache-2.0_WITH_LLVM-exception`, `LICENSE-APACHE`, and `LICENSE-MIT` in the repository root.
+
+## Code of Conduct
+
+cap-std follows the [Bytecode Alliance Contributor Covenant Code of Conduct](https://github.com/bytecodealliance/cap-std/blob/main/CODE_OF_CONDUCT.md). All contributors and maintainers are expected to uphold a welcoming, inclusive, and harassment-free environment for everyone, regardless of age, background, experience level, nationality, or identity.
+
+Unacceptable behavior includes but is not limited to:
+- Sexualized language or unwelcome advances
+- Trolling, insulting, or derogatory comments
+- Public or private harassment
+- Publishing others' private information without consent
+
+Instances of unacceptable behavior may be reported to the Bytecode Alliance CoC team at [report@bytecodealliance.org](mailto:report@bytecodealliance.org). Reports are treated with confidentiality.
+
+There is also an [Organizational Code of Conduct](https://github.com/bytecodealliance/cap-std/blob/main/ORG_CODE_OF_CONDUCT.md) that governs the behavior of organizations participating in the Bytecode Alliance.
+
+## Bytecode Alliance Membership
+
+cap-std is a core project of the [Bytecode Alliance](https://bytecodealliance.org/), a nonprofit industry organization dedicated to building secure, efficient, and portable software using WebAssembly and related technologies. cap-std serves as the foundation for WASI filesystem sandboxing in [Wasmtime](https://wasmtime.dev/), the Bytecode Alliance's production WebAssembly runtime.
+
+Contributions to cap-std directly contribute to the security and correctness of the broader WebAssembly ecosystem.
+
+## Quick Links
+
+<CardGroup cols={3}>
+  <Card title="GitHub Issues" icon="circle-exclamation" href="https://github.com/bytecodealliance/cap-std/issues">
+    Report bugs, request features, or browse open issues on the cap-std GitHub repository.
+  </Card>
+  <Card title="CONTRIBUTING.md" icon="code-pull-request" href="https://github.com/bytecodealliance/cap-std/blob/main/CONTRIBUTING.md">
+    The official contributing guide in the repository, covering tests, fuzzing, and benchmarking.
+  </Card>
+  <Card title="Code of Conduct" icon="shield-halved" href="https://github.com/bytecodealliance/cap-std/blob/main/CODE_OF_CONDUCT.md">
+    The Bytecode Alliance Contributor Covenant Code of Conduct that governs participation in cap-std.
+  </Card>
+</CardGroup>

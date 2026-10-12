@@ -1,0 +1,128 @@
+---
+title: "Platform Support and Performance in cap-std"
+sidebarTitle: "Platform Support"
+description: "cap-std supports Linux, macOS, FreeBSD, and Windows, with optimized single-syscall Dir::open on Linux 5.6+ and FreeBSD 13.0+."
+---
+
+cap-std provides a consistent capability-based filesystem API across all major platforms. Wherever possible, it delegates to native OS primitives to enforce sandboxing efficiently in a single system call. Where those primitives are unavailable, it falls back to a careful, component-by-component path traversal algorithm that maintains the same security guarantees without sacrificing correctness.
+
+## Supported Platforms
+
+The following platforms are officially supported and tested in CI:
+
+| Platform | Tier | Notes |
+|---|---|---|
+| Linux (x86\_64, aarch64, and others) | Full | `openat2` fast path on kernel 5.6+; falls back to manual resolution |
+| macOS / iOS / tvOS / watchOS / visionOS | Full | Manual component-by-component resolution via `rustix` |
+| FreeBSD | Full | `openat(O_RESOLVE_BENEATH)` fast path on FreeBSD 13.0+; falls back to manual resolution |
+| Windows | Full | Windows-native path resolution via `windows-sys`; see caveats below |
+| Android | Supported | Falls back to manual resolution; `openat2` is blocked by Android's seccomp policy |
+| WASI | In development | Basic support via `wasi_ext`; thin API layer over WASI host capabilities |
+
+<Note>
+  Linux support follows the same floor as the Rust standard library itself:
+  kernels older than 2.6.32 are not supported, as documented in the
+  `cap-primitives` source.
+</Note>
+
+## Performance by Platform
+
+### Linux 5.6+ — `openat2` Fast Path
+
+On Linux 5.6 and newer, cap-std uses the [`openat2`](https://lwn.net/Articles/796868/) syscall with the `RESOLVE_BENEATH` flag to implement `Dir::open` in a **single system call** for the common case. Several other operations also benefit internally from `openat2`, [`O_PATH`](https://man7.org/linux/man-pages/man2/open.2.html), and [`/proc/self/fd`](https://man7.org/linux/man-pages/man5/proc.5.html) to accelerate path resolution.
+
+```rust
+// On Linux 5.6+, this compiles down to a single openat2 syscall
+let file = dir.open("path/to/file.txt")?;
+```
+
+The `/proc/self/fd` optimization is used only when `/proc` is mounted, it is genuinely `procfs`, and there are no additional mounts on top of it — cap-std verifies each of these conditions.
+
+If `openat2` returns `ENOSYS` (not available on this kernel), cap-std automatically falls back to the manual resolution algorithm described below, with no configuration required.
+
+### FreeBSD 13.0+ — `openat(O_RESOLVE_BENEATH)` Fast Path
+
+On FreeBSD 13.0 and newer, cap-std uses `openat` with the `O_RESOLVE_BENEATH` flag to implement `Dir::open` in a **single system call** in common cases. Additional operations internally use `AT_RESOLVE_BENEATH` and `O_PATH` for fast resolution.
+
+```rust
+// On FreeBSD 13.0+, this resolves in a single openat call
+let file = dir.open("path/to/file.txt")?;
+```
+
+If `O_RESOLVE_BENEATH` is not supported on the running FreeBSD version, cap-std falls back to the manual resolution path.
+
+### Other Platforms — Component-by-Component Resolution
+
+On macOS, older Linux kernels, older FreeBSD versions, Windows, and other platforms, cap-std opens each component of a path **individually**, one at a time, in order to inspect and validate `..` components and symlink targets as it goes.
+
+The algorithm is carefully designed to minimize system calls. For example, opening the path `red/green/blue` performs exactly **5 system calls**:
+
+1. Open `red` (relative to the `Dir`)
+2. Open `green` (relative to `red`)
+3. Open `blue` (relative to `green`)
+4. Close the handle for `red`
+5. Close the handle for `green`
+
+```rust
+// On platforms without native RESOLVE_BENEATH, this path opens
+// each component in sequence: red → green → blue (5 syscalls total)
+let file = dir.open("red/green/blue")?;
+```
+
+This ensures that symlinks traversed during any step of the path are validated against the sandbox boundary before the next step proceeds.
+
+## WASI Support
+
+cap-std is a foundation for the [WASI](https://github.com/WebAssembly/WASI/) implementation in [Wasmtime](https://wasmtime.dev/). In a WASI environment, cap-std becomes an especially thin layer — thinner than `libstd`'s filesystem APIs — because WASI's own capability-based host APIs already enforce sandbox boundaries, eliminating the need for extra code to handle absolute paths or symlink escapes.
+
+<Note>
+  WASI support is currently in active development. The `wasi_ext` feature is
+  enabled via a Rust `cfg_attr` and tracks the evolution of the WASI standard.
+</Note>
+
+## Minimum Supported Rust Version (MSRV)
+
+```toml
+# workspace Cargo.toml
+rust-version = "1.70"
+```
+
+cap-std requires **Rust 1.70** when default features are enabled. Some optional features impose stricter requirements:
+
+| Feature | Notes |
+|---|---|
+| `fs_utf8` | Enables UTF-8 path types via [`camino`](https://crates.io/crates/camino) |
+| `arf_strings` | Enables lossless encoding of arbitrary byte sequences in UTF-8; requires `fs_utf8` |
+
+<Tip>
+  Use `cargo +nightly bench` to run the included micro-benchmarks for
+  `Dir::open` and other filesystem operations across the API surface.
+</Tip>
+
+## Windows-Specific Details
+
+cap-std supports Windows through the `windows-sys` crate, using Windows-native filesystem APIs for path resolution and sandboxing.
+
+<Warning>
+  On Windows, when constructing a `Dir` from an existing `std::fs::File` via
+  `Dir::from_std_file`, the underlying file handle **must** have been opened
+  **without** the `FILE_SHARE_DELETE` flag. Opening with `FILE_SHARE_DELETE`
+  allows another process to rename or delete the directory between the time
+  cap-std checks it and the time it uses it, creating a race condition that
+  could allow path traversal outside the sandbox. This same restriction applies
+  to `Dir::from_raw_handle`.
+</Warning>
+
+All methods on `Dir` that open a new directory handle (such as `Dir::open_dir`) apply the correct sharing flags automatically — the restriction above only applies when you bring your own pre-opened handle.
+
+## Platform Feature Matrix
+
+| Feature | Linux 5.6+ | FreeBSD 13.0+ | macOS | Windows | WASI |
+|---|---|---|---|---|---|
+| Single-syscall `Dir::open` | ✅ `openat2` | ✅ `O_RESOLVE_BENEATH` | ❌ Manual | ❌ Manual | ✅ Host API |
+| `O_PATH` optimization | ✅ | ✅ | ❌ | ❌ | N/A |
+| `/proc/self/fd` optimization | ✅ | ❌ | ❌ | ❌ | N/A |
+| `AT_RESOLVE_BENEATH` | N/A | ✅ | ❌ | ❌ | N/A |
+| Symlink sandboxing | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `..` sandboxing | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Absolute path rejection | ✅ | ✅ | ✅ | ✅ | ✅ |

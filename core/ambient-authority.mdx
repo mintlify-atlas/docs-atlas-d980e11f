@@ -1,0 +1,181 @@
+---
+title: "AmbientAuthority: Auditing Privileged Operations"
+sidebarTitle: "Ambient Authority"
+description: "How cap-std's AmbientAuthority token marks and audits privileged operations that bypass capability-based sandboxing."
+---
+
+In a pure capability-based system, every operation on an external resource requires holding a capability — an unforgeable value that grants access to that specific resource. In practice, however, some operations unavoidably require reaching outside any pre-established capability: opening the very first directory, granting network access to a new address, or reading the system clock for the first time. These operations use what is called *ambient authority* — access that is granted implicitly by virtue of running as an OS process, rather than through an explicit capability chain.
+
+`cap_std` does not eliminate ambient authority. Instead, it makes it **explicit and auditable**. Every function in `cap_std` that uses ambient authority accepts an `AmbientAuthority` argument. This zero-sized token carries no data and performs no enforcement — its sole purpose is to appear in function signatures and call sites, creating a textual trail that makes it easy to find every place in a codebase where ambient authority is exercised.
+
+## The `AmbientAuthority` type
+
+`AmbientAuthority` is a zero-sized struct defined in the [`ambient-authority`](https://crates.io/crates/ambient-authority) crate and re-exported from `cap_std`:
+
+```rust
+// Internally, it's just this:
+pub struct AmbientAuthority(());
+```
+
+It has no fields, no methods, and no runtime cost. It is purely a compile-time marker in function signatures.
+
+---
+
+## Obtaining `AmbientAuthority`
+
+There are two ways to obtain an `AmbientAuthority` value.
+
+### `ambient_authority()`
+
+```rust
+use cap_std::ambient_authority;
+
+let aa = ambient_authority();
+```
+
+`ambient_authority()` is a regular function that unconditionally returns an `AmbientAuthority`. It is re-exported from `cap_std` at the crate root. Call it at your program's entry point or configuration layer when you are deliberately exercising ambient access.
+
+### `ambient_authority_known_at_compile_time!()`
+
+```rust
+use cap_std::ambient_authority_known_at_compile_time;
+
+const AA: cap_std::AmbientAuthority = ambient_authority_known_at_compile_time!();
+```
+
+This macro is a `const`-compatible alternative for use in `const` contexts (for example, initializing a `static` `SystemClock`). It is semantically identical to `ambient_authority()`.
+
+---
+
+## Functions that require `AmbientAuthority`
+
+Any function that bypasses the capability model must accept `AmbientAuthority`. Here are the main call sites in `cap_std`:
+
+### Filesystem
+
+| Function | Why it needs ambient authority |
+|----------|-------------------------------|
+| `Dir::open_ambient_dir(path, aa)` | Opens any path in the global filesystem namespace |
+| `Dir::open_parent_dir(&self, aa)` | Escapes the current `Dir`'s subtree into the parent |
+| `Dir::create_ambient_dir_all(path, aa)` | Creates directories in the global namespace |
+| `File::open_ambient(path, aa)` | Opens any file in the global filesystem namespace |
+| `File::create_ambient(path, aa)` | Creates any file in the global filesystem namespace |
+| `File::open_ambient_with(path, opts, aa)` | Opens any file with custom options |
+
+### Networking
+
+| Function | Why it needs ambient authority |
+|----------|-------------------------------|
+| `Pool::insert(addrs, aa)` | Grants the pool access to an external address |
+| `Pool::insert_socket_addr(addr, aa)` | Grants access to a specific socket address |
+| `Pool::insert_ip_net_port_any(net, aa)` | Grants access to a whole IP network |
+| `Pool::insert_ip_net_port_range(net, start, end, aa)` | Grants access to a port range |
+| `Pool::insert_ip_net(net, port, aa)` | Grants access to a network on a specific port |
+
+### Time
+
+| Function | Why it needs ambient authority |
+|----------|-------------------------------|
+| `SystemClock::new(aa)` | Grants capability to read wall-clock time |
+| `MonotonicClock::new(aa)` | Grants capability to read monotonic time |
+
+---
+
+## Using `AmbientAuthority` at a boundary
+
+The idiomatic pattern is to call `ambient_authority()` once, near the top of `main`, and then pass the resulting capabilities (directories, pools, clocks) inward through your application. Interior code never calls `ambient_authority()` directly — it only receives and uses capabilities.
+
+```rust
+use cap_std::{
+    ambient_authority,
+    fs::Dir,
+    net::Pool,
+    time::{MonotonicClock, SystemClock},
+};
+
+fn main() -> std::io::Result<()> {
+    let aa = ambient_authority();
+
+    // Establish capabilities at the boundary
+    let data_dir = Dir::open_ambient_dir("/var/myapp/data", aa)?;
+    let log_dir  = Dir::open_ambient_dir("/var/log/myapp", aa)?;
+
+    let mut pool = Pool::new();
+    pool.insert("api.example.com:443", aa)?;
+
+    let clock = SystemClock::new(aa);
+    let mono  = MonotonicClock::new(aa);
+
+    // Hand capabilities to application logic — no ambient_authority() inside
+    run_app(data_dir, log_dir, pool, clock, mono)
+}
+
+fn run_app(
+    data: Dir,
+    logs: Dir,
+    network: Pool,
+    clock: SystemClock,
+    mono: MonotonicClock,
+) -> std::io::Result<()> {
+    // All operations are capability-gated here
+    data.write("last_run.txt", clock.now().duration_since(
+        cap_std::time::SystemClock::UNIX_EPOCH
+    ).unwrap().as_secs().to_string().as_bytes())?;
+    Ok(())
+}
+```
+
+---
+
+## The audit trail
+
+Because every ambient operation requires `AmbientAuthority`, you can find all of them with a simple code search:
+
+```sh
+# Find every site that exercises ambient authority in your project
+grep -rn "ambient_authority()" src/
+```
+
+In a well-structured cap-std application, this search should return only a small number of results concentrated in `main.rs` or a dedicated setup module. If it returns hits deep in business logic, that is a signal that ambient access is being used where a capability should be passed instead.
+
+---
+
+## Passing capabilities vs. passing `AmbientAuthority`
+
+<Warning>
+  Do not pass `AmbientAuthority` deep into your application logic as if it were a capability. Doing so defeats the purpose: a function that accepts `AmbientAuthority` and then calls `Dir::open_ambient_dir` on an arbitrary path is no more sandboxed than one that calls `std::fs::File::open` directly.
+
+  The right approach is to resolve ambient resources at the program boundary and pass the resulting `Dir`, `Pool`, or clock objects to the rest of the program. Those objects carry narrowly scoped authority — a `Dir` only grants access to files within it; a `Pool` only grants access to the addresses it contains.
+</Warning>
+
+```rust
+// ❌ Wrong: propagating ambient authority into application logic
+fn load_config(path: &str, aa: cap_std::AmbientAuthority) -> Config {
+    let dir = cap_std::fs::Dir::open_ambient_dir(path, aa).unwrap();
+    // ...
+}
+
+// ✅ Right: resolve at the boundary, pass a Dir
+fn load_config(config_dir: &cap_std::fs::Dir) -> Config {
+    let text = config_dir.read_to_string("config.toml").unwrap();
+    // ...
+}
+```
+
+---
+
+## `AmbientAuthority` in `const` contexts
+
+When you need a clock or other ambient resource available at program startup in a `static`, use the macro form:
+
+```rust
+use cap_std::{ambient_authority_known_at_compile_time, time::SystemClock};
+
+static CLOCK: SystemClock = SystemClock::new(ambient_authority_known_at_compile_time!());
+
+fn log_event(msg: &str) {
+    println!("[{:?}] {}", CLOCK.now(), msg);
+}
+```
+
+The macro name is intentionally verbose — it signals to reviewers that ambient authority was considered and accepted at that site.

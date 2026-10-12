@@ -1,47 +1,282 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with cap-std: Sandboxed Rust I/O in Steps"
+sidebarTitle: "Quickstart"
+description: "Add cap-std to a Rust project, open a sandboxed directory with Dir, read and write files safely, and scope network access with Pool in four steps."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through adding `cap-std` to a new or existing Rust project, opening your first capability-based directory, performing sandboxed file operations, and scoping network connections with `Pool`. By the end you will have a working program whose filesystem and network access is both declared in its type signatures and enforced at runtime.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+**Minimum Supported Rust Version (MSRV):** `cap-std` requires Rust **1.70** or later when default features are enabled. Some optional features have stricter requirements.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+<Step title="Add cap-std to Cargo.toml">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Add `cap-std` as a dependency in your `Cargo.toml`:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+```toml
+[dependencies]
+cap-std = "4.0.3"
+```
+
+If you also need extended filesystem or networking operations, add the companion crates you need:
+
+```toml
+[dependencies]
+cap-std        = "4.0.3"
+cap-fs-ext     = "4.0.3"   # extra filesystem operations
+cap-net-ext    = "4.0.3"   # extra networking helpers
+cap-directories = "4.0.3"  # standard app-data directories
+cap-tempfile   = "4.0.3"   # temporary directories
+cap-rand       = "4.0.3"   # random number generation
+```
+
+### Optional features
+
+`cap-std` ships two opt-in features you can enable in `Cargo.toml`:
+
+```toml
+[dependencies]
+cap-std = { version = "4.0.3", features = ["fs_utf8"] }
+```
+
+| Feature | Description |
+|---|---|
+| `fs_utf8` | Enables `cap_std::fs_utf8`, which uses [`camino`](https://crates.io/crates/camino) `Utf8Path` types so paths are always valid UTF-8. |
+| `arf_strings` | Enables lossless encoding of arbitrary host byte sequences inside UTF-8 strings using the [arf-strings](https://github.com/bytecodealliance/arf-strings/) technique. Implies `fs_utf8`. |
+
+</Step>
+
+<Step title="Open an ambient directory to get your first Dir">
+
+Every cap-std operation is relative to a `Dir`. Because every resource in the capability model must itself come from another resource, you need one entry point that uses *ambient authority* — the same kind of access that `std::fs` always uses. cap-std makes this explicit with the `ambient_authority()` token:
+
+```rust
+use cap_std::fs::Dir;
+use cap_std::ambient_authority;
+
+fn main() -> std::io::Result<()> {
+    // ambient_authority() is a zero-sized token that documents the fact
+    // that this call uses unrestricted OS access. Treat any call site
+    // that takes AmbientAuthority as a security boundary.
+    let dir = Dir::open_ambient_dir("./my_app_data", ambient_authority())?;
+
+    // From here on, all operations go through `dir` and are sandboxed.
+    Ok(())
+}
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Prefer obtaining `Dir` values from `cap-directories` or `cap-tempfile` rather than `open_ambient_dir` whenever possible — those crates return `Dir` values without exposing ambient authority to the rest of your code.
 </Tip>
+
+You can also obtain a `Dir` from the other crates in the family:
+
+```rust
+use cap_directories::{ambient_authority, ProjectDirs};
+
+let project_dirs = ProjectDirs::from(
+    "com.example",
+    "Example Organization",
+    "My App",
+    ambient_authority(),
+)
+.expect("could not determine project directories");
+
+// data_dir() returns a Dir, not a raw PathBuf
+let data_dir = project_dirs.data_dir()?;
+```
+
+</Step>
+
+<Step title="Open and manipulate files relative to the Dir">
+
+Once you hold a `Dir`, all file operations use paths that are strictly relative to it. The API mirrors `std::fs` — there is no new vocabulary to learn:
+
+```rust
+use std::io;
+use cap_std::fs::Dir;
+
+fn dir_example(dir: &Dir) -> io::Result<()> {
+    // Open a file for reading — path must be relative and stay inside dir
+    let file = dir.open("the/thing.txt")?;
+
+    // This returns PermissionDenied — `..` escapes the sandbox
+    let hidden = dir.open("../hidden.txt")?;
+
+    // Creating symlinks to absolute paths is also blocked
+    dir.symlink("/hidden.txt", "misdirection.txt")?;
+
+    // Even a pre-existing symlink that leads outside dir is blocked
+    let secret = dir.open("misdirection.txt")?;
+
+    Ok(())
+}
+```
+
+Here is a broader tour of the `Dir` API:
+
+```rust
+use cap_std::fs::Dir;
+use cap_std::ambient_authority;
+use std::io::{self, Write};
+
+fn main() -> io::Result<()> {
+    let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+    // Write a file
+    dir.write("hello.txt", b"Hello, cap-std!\n")?;
+
+    // Read it back
+    let contents = dir.read("hello.txt")?;
+    println!("{}", String::from_utf8_lossy(&contents));
+
+    // Create a subdirectory (and all missing parents)
+    dir.create_dir_all("data/cache")?;
+
+    // Open a subdirectory as its own Dir — now `subdir` is sandboxed
+    // to data/cache and nothing above it
+    let subdir = dir.open_dir("data/cache")?;
+    subdir.write("item.bin", &[0u8; 64])?;
+
+    // Rename, copy, remove
+    dir.rename("hello.txt", &dir, "hello_renamed.txt")?;
+    dir.remove_file("hello_renamed.txt")?;
+    dir.remove_dir_all("data")?;
+
+    Ok(())
+}
+```
+
+### `fs_utf8` — UTF-8 paths
+
+Enable the `fs_utf8` feature to work with [`camino::Utf8Path`](https://docs.rs/camino/latest/camino/struct.Utf8Path.html) instead of `std::path::Path`, guaranteeing that all paths are valid UTF-8:
+
+```rust
+// Cargo.toml: cap-std = { version = "4.0.3", features = ["fs_utf8"] }
+use cap_std::fs_utf8::Dir;
+use cap_std::ambient_authority;
+
+let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+let file = dir.open("config.toml")?; // path is a &camino::Utf8Path
+```
+
+</Step>
+
+<Step title="Scope network access with Pool">
+
+`Pool` is the networking equivalent of `Dir`. Create an empty pool and explicitly add the addresses your code is allowed to reach. Any connection attempt to an address not in the pool returns `PermissionDenied`:
+
+```rust
+use std::io;
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+
+fn pool_example(pool: &Pool) -> io::Result<()> {
+    // Succeeds only if localhost:3333 was inserted into the pool
+    let stream = pool.connect_tcp_stream("localhost:3333")?;
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let mut pool = Pool::new();
+
+    // insert() requires ambient_authority() to document the fact that
+    // you are explicitly granting access to this address.
+    pool.insert("localhost:3333", ambient_authority())?;
+
+    pool_example(&pool)?;
+    Ok(())
+}
+```
+
+You can also add entire IP subnets using [`ipnet`](https://docs.rs/ipnet/):
+
+```rust
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+use cap_std::ipnet::IpNet;
+
+let mut pool = Pool::new();
+
+// Allow any port on the 192.168.1.0/24 subnet
+let net: IpNet = "192.168.1.0/24".parse().unwrap();
+pool.insert_ip_net_port_any(net, ambient_authority());
+
+// Allow only port 443 on the same subnet
+pool.insert_ip_net(net, 443, ambient_authority());
+```
+
+`Pool` implements `Clone`, so you can pass narrower subsets of authority to different parts of your application by constructing separate pools with different entries.
+
+</Step>
+
+</Steps>
+
+## Complete example: a key-value CLI store
+
+The following example is adapted from the [`kv-cli` example](https://github.com/bytecodealliance/cap-std/blob/main/examples/kv-cli.rs) in the cap-std repository. It uses `cap-directories` to locate the platform's standard application data directory and `cap-std` to safely read and write key-value pairs stored as files — all without ever constructing a bare `PathBuf` that might escape the data directory.
+
+```rust
+use cap_directories::{ambient_authority, ProjectDirs};
+use std::env::args;
+use std::path::PathBuf;
+use std::str;
+
+fn main() -> anyhow::Result<()> {
+    let mut args = args();
+    args.next(); // skip program name
+    let key: PathBuf = args.next().ok_or_else(|| usage())?.into();
+    let value = args.next();
+
+    // Locate the data directory for this application.
+    let project_dirs = ProjectDirs::from(
+        "com.example",
+        "Example Organization",
+        "Cap-std Key-Value CLI Example",
+        ambient_authority(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("could not determine project directories"))?;
+
+    let mut data_dir = project_dirs.data_dir()?;
+
+    if let Some(value) = value {
+        // kv-cli key value — set the value of key
+        let parent = key.parent();
+        let file_name = key.file_name()
+            .ok_or_else(|| anyhow::anyhow!("key must end with a filename"))?;
+
+        if let Some(parent) = parent {
+            if !parent.as_os_str().is_empty() {
+                data_dir.create_dir_all(parent)?;
+                data_dir = data_dir.open_dir(parent)?;
+            }
+        }
+        data_dir.write(file_name, value)?;
+    } else {
+        // kv-cli key — get the value of key
+        println!("{}", str::from_utf8(&data_dir.read(key)?)?);
+    }
+
+    Ok(())
+}
+
+fn usage() -> anyhow::Error {
+    anyhow::anyhow!("usage: kv-cli <key> [<value>]")
+}
+```
+
+Notice that `data_dir.write(file_name, value)` and `data_dir.read(key)` can never escape the application's data directory — the sandbox is enforced automatically, not by manual path-validation logic.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="house" href="/introduction">
+    Learn what cap-std is, why capability-based security matters, and how the crate family fits together.
+  </Card>
+  <Card title="Concepts" icon="book-open" href="/concepts">
+    Understand Dir, Pool, AmbientAuthority, RESOLVE_BENEATH semantics, and the limits of the sandbox.
+  </Card>
+</CardGroup>

@@ -1,0 +1,205 @@
+---
+title: "Sandboxing with cap-std: Least Privilege in Rust"
+sidebarTitle: "Sandboxing"
+description: "Learn how cap-std enforces least-privilege filesystem and network access in Rust using capability-based Dir and Pool handles to prevent path traversal."
+---
+
+Capability-based security is the idea that code should only be able to access resources it has been explicitly given a handle to—not anything the operating system happens to allow. `cap-std` brings this model to Rust by replacing ambient-authority APIs like `std::fs::File::open("/any/path")` with handle-scoped operations like `dir.open("relative/path")`. The result is programs that declare their intent in their type signatures and are automatically protected against a whole class of path-traversal attacks.
+
+## Design Principles
+
+Traditional programs operate with *ambient authority*: any code anywhere in the process can open `/etc/passwd` or connect to any network address, as long as the OS permits it. Capability-based security replaces this with *object capabilities*: an open directory handle (`Dir`) or a network address pool (`Pool`) that must be passed explicitly to every function that needs access.
+
+The two central types in cap-std are:
+
+- **`cap_std::fs::Dir`** — an open handle to a directory. All file operations are scoped to that directory; paths outside it are rejected automatically.
+- **`cap_std::net::Pool`** — a set of network addresses and ports that a function is permitted to connect to.
+
+By structuring programs around these types, the set of resources a function can touch is visible directly in its signature—no global state, no ambient filesystem namespace, no side channels.
+
+## Granting Access
+
+Every program needs a starting point. `Dir::open_ambient_dir` is the escape hatch that bridges the traditional OS model to cap-std's capability model. Call it once, at startup, to obtain a `Dir` for the root of whatever data your program manages, then pass sub-directories down to the code that needs them.
+
+```rust
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+
+fn main() -> std::io::Result<()> {
+    // Only called once, at the entry point. This is the only place
+    // that uses ambient authority (i.e. can open anything the OS allows).
+    let data_dir = Dir::open_ambient_dir("/var/myapp/data", ambient_authority())?;
+
+    // Pass a sub-directory handle to the subsystem that needs it.
+    let uploads = data_dir.open_dir("uploads")?;
+    process_uploads(&uploads)?;
+
+    Ok(())
+}
+```
+
+Alternatively, use the companion crates to obtain your first `Dir` without ever hardcoding a path:
+
+- **`cap-directories`** — provides `Dir` handles for standard application data, cache, and config directories (wraps the [`directories`](https://docs.rs/directories) crate).
+- **`cap-tempfile`** — provides `Dir` handles for temporary directories.
+
+```rust
+use cap_directories::{ambient_authority, ProjectDirs};
+
+fn main() -> anyhow::Result<()> {
+    let project_dirs = ProjectDirs::from(
+        "com.example",
+        "Example Org",
+        "My App",
+        ambient_authority(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+
+    // data_dir is a cap_std::fs::Dir — fully sandboxed from here on.
+    let data_dir = project_dirs.data_dir()?;
+    data_dir.write("settings.json", b"{}")?;
+    Ok(())
+}
+```
+
+<Note>
+`ambient_authority()` is a token that marks call sites which bypass the capability model. Searching your codebase for `ambient_authority` shows every place where sandboxing is intentionally relaxed—making security audits straightforward.
+</Note>
+
+## Receiving Capabilities
+
+The key design pattern is passing `Dir` (or `&Dir`) as a parameter instead of accepting bare path strings. This makes a function's resource requirements explicit in its type signature.
+
+**Before** — ambient authority, opaque intent:
+
+```rust
+fn process_upload(filename: &str) -> std::io::Result<()> {
+    // Could open *anything*. Path traversal attacks are possible.
+    let file = std::fs::File::open(format!("/var/myapp/uploads/{filename}"))?;
+    // ...
+    Ok(())
+}
+```
+
+**After** — capability-based, intent is clear:
+
+```rust
+use cap_std::fs::Dir;
+
+fn process_upload(uploads_dir: &Dir, filename: &str) -> std::io::Result<()> {
+    // Can only open files inside uploads_dir. Path traversal is impossible.
+    let file = uploads_dir.open(filename)?;
+    // ...
+    Ok(())
+}
+```
+
+The signature `fn process_upload(uploads_dir: &Dir, filename: &str)` communicates that this function reads from `uploads_dir` and nothing else. A reviewer can see the scope without reading the implementation.
+
+## Path Traversal Protection
+
+`Dir` uses `RESOLVE_BENEATH`-style path resolution: every component of the path is checked to ensure it stays inside the directory. Paths with `..`, absolute paths, and symlinks that escape the sandbox all return `PermissionDenied`.
+
+<Steps>
+  <Step title="Paths with '..' are blocked">
+    Any path component that would walk above the `Dir`'s root is rejected immediately.
+
+    ```rust
+    use cap_std::fs::Dir;
+    use cap_std::ambient_authority;
+
+    let dir = Dir::open_ambient_dir("/var/myapp/uploads", ambient_authority())?;
+
+    // Attempting to escape with '..' returns an error.
+    let result = dir.open("../../../etc/passwd");
+    assert!(result.is_err()); // PermissionDenied
+    ```
+  </Step>
+
+  <Step title="Absolute paths are blocked">
+    Passing an absolute path like `"/etc/shadow"` is always an error, even if the path exists on disk.
+
+    ```rust
+    let result = dir.open("/etc/shadow");
+    assert!(result.is_err()); // PermissionDenied
+    ```
+
+    This also catches accidental use of well-known absolute paths (e.g. `/etc/resolv.conf`) that might slip into code that calls `dir.open(some_path)`.
+  </Step>
+
+  <Step title="Escaping symlinks are blocked">
+    Symlinks that point outside the sandbox are followed up to the boundary, then rejected.
+
+    ```rust
+    // Attempting to create a symlink to an absolute path fails.
+    let result = dir.symlink("/secret/data", "misdirection.txt");
+    assert!(result.is_err()); // PermissionDenied
+
+    // Even if a pre-existing symlink escapes, following it fails.
+    let result = dir.open("misdirection.txt");
+    assert!(result.is_err()); // PermissionDenied
+    ```
+  </Step>
+</Steps>
+
+All three checks happen automatically on every `Dir` method—there is no separate "sanitize the path" step to forget.
+
+## Symlink Behavior
+
+cap-std supports symlinks that stay *within* the sandbox. A symlink from `uploads/a/link.txt` to `../b/target.txt` is fine as long as `uploads/b/target.txt` resolves inside the same `Dir`. Only symlinks that would lead *outside* the root are rejected.
+
+```rust
+use cap_std::fs::Dir;
+use cap_std::ambient_authority;
+
+let dir = Dir::open_ambient_dir("/var/myapp", ambient_authority())?;
+
+// Relative symlinks that stay inside the Dir work fine.
+dir.symlink("../images/logo.png", "assets/logo.png")?; // OK if target stays inside dir
+
+// Symlinks to absolute paths are blocked at creation time.
+let result = dir.symlink("/tmp/evil", "assets/evil");
+assert!(result.is_err());
+```
+
+<Note>
+This is different from `RESOLVE_IN_ROOT`-style sandboxing (used by `pathrs` and `unix_fd`), where absolute symlinks are re-rooted inside the Dir. cap-std uses `RESOLVE_BENEATH`, so absolute symlinks are always errors. This makes behavior more predictable and avoids surprising divergence between symlink targets inside and outside the Dir.
+</Note>
+
+## Networking
+
+For network access, cap-std provides `cap_std::net::Pool`, which plays the same role as `Dir` for filesystem resources. Add addresses to a `Pool` at startup and pass the pool to functions that need network access.
+
+```rust
+use cap_std::net::Pool;
+use cap_std::ambient_authority;
+
+fn fetch_data(pool: &Pool) -> std::io::Result<()> {
+    // Only addresses explicitly inserted into the pool can be reached.
+    let stream = pool.connect_tcp_stream("api.example.com:443")?;
+    // ...
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    let mut pool = Pool::new();
+    pool.insert_tcp("api.example.com", 443..=443, ambient_authority())?;
+
+    fetch_data(&pool)?;
+    Ok(())
+}
+```
+
+## Limitations
+
+<Warning>
+cap-std does **not** sandbox untrusted Rust code. It is a tool for trusted code to declare and enforce its own access policies.
+</Warning>
+
+cap-std cannot prevent:
+
+- **`unsafe` code** that calls OS APIs directly, bypasses Rust's type system, or uses raw pointers to forge file descriptors.
+- **Direct `std::fs` usage** anywhere in the codebase. cap-std only intercepts calls made through `cap_std::fs::Dir`; calling `std::fs::File::open` in the same process is completely unrestricted.
+- **Malicious dependencies** that link native code, spawn subprocesses, or use any other OS interface.
+
+What cap-std *does* provide is a way for cooperative, trusted code to opt in to a stricter access model—making path traversal bugs structurally impossible rather than just checked at runtime, and making security audits easier by surfacing all ambient-authority usage through the `ambient_authority()` token.

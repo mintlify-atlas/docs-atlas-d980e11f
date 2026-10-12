@@ -1,0 +1,249 @@
+---
+title: "cap-rand: Capability-Based Random Number Generation"
+sidebarTitle: "cap-rand"
+description: "A capability-based wrapper around the rand crate — OsRng and CapRng require explicit authority tokens, making entropy access auditable."
+---
+
+The `cap-rand` crate provides a capability-based interface to random number generation, wrapping the [`rand`](https://crates.io/crates/rand) crate. The two key types — `OsRng` and `CapRng` — require an `AmbientAuthority` token to construct, making access to the operating system's entropy source explicit, auditable, and controllable rather than an invisible global operation.
+
+## Installation
+
+```toml
+[dependencies]
+cap-rand = "4.0.3"
+```
+
+Enable the `small_rng` feature to expose `rand::rngs::SmallRng`:
+
+```toml
+[dependencies]
+cap-rand = { version = "4.0.3", features = ["small_rng"] }
+```
+
+---
+
+## Core types
+
+### `OsRng`
+
+A random number generator that reads entropy directly from the operating system. It corresponds to `rand::rngs::OsRng`, but instead of implementing `Default` (which would be ambient), it has a `default` constructor that requires `AmbientAuthority`.
+
+```rust
+pub struct OsRng(/* private */);
+
+impl OsRng {
+    /// Returns an OsRng instance.
+    ///
+    /// # Ambient Authority
+    /// Makes use of ambient authority to access the platform entropy source.
+    pub const fn default(ambient_authority: AmbientAuthority) -> Self;
+}
+```
+
+`OsRng` implements `TryRngCore` and `TryCryptoRng`, making it suitable for seeding other PRNGs and for cryptographic use.
+
+### `CapRng`
+
+A convenience PRNG backed by a thread-local `rand::rngs::ThreadRng`. It is not tied to thread-local storage (you can store it in a struct), but it draws its initial entropy from the OS. Corresponds to `rand::rngs::ThreadRng` minus the ambient `Default` impl.
+
+```rust
+pub struct CapRng { /* private */ }
+
+impl CapRng {
+    /// Alias for `cap_rand::thread_rng`.
+    ///
+    /// # Ambient Authority
+    /// Makes use of ambient authority to access the platform entropy source.
+    pub fn default(ambient_authority: AmbientAuthority) -> Self;
+}
+```
+
+`CapRng` implements `RngCore` and `CryptoRng`.
+
+---
+
+## Free functions
+
+### `thread_rng`
+
+```rust
+/// Returns a lazily-initialized thread-local PRNG seeded by the OS.
+/// Corresponds to rand::rng().
+///
+/// # Ambient Authority
+pub fn thread_rng(ambient_authority: AmbientAuthority) -> CapRng;
+```
+
+### `std_rng_from_os_rng`
+
+```rust
+/// Returns a StdRng seeded from the OS entropy source.
+/// Corresponds to rand::rngs::StdRng::from_os_rng().
+///
+/// # Ambient Authority
+pub fn std_rng_from_os_rng(ambient_authority: AmbientAuthority) -> StdRng;
+```
+
+### `random`
+
+```rust
+/// Generates a single random value using the thread-local RNG.
+/// Corresponds to rand::random().
+///
+/// # Ambient Authority
+pub fn random<T>(ambient_authority: AmbientAuthority) -> T
+where
+    StandardUniform: Distribution<T>;
+```
+
+---
+
+## Why use `std_rng_from_os_rng` instead of `SeedableRng::from_entropy`?
+
+The `rand::SeedableRng` trait includes a `from_entropy()` method that reads directly from the OS entropy source without any explicit authority token. Although `cap-rand` re-exports `SeedableRng`, calling `SeedableRng::from_entropy()` on types that implement it (like `StdRng`) bypasses the capability model.
+
+<Warning>
+  Do **not** call `rand::SeedableRng::from_entropy()` on `StdRng` or any other
+  type in a capability-safe program. Use `cap_rand::std_rng_from_os_rng(ambient_authority())`
+  instead, which requires an explicit authority token and is easy to audit.
+</Warning>
+
+```rust
+// ❌ Bypasses capability model — ambient entropy access, invisible to auditors
+use rand::SeedableRng;
+let rng = rand::rngs::StdRng::from_entropy();
+
+// ✅ Explicit ambient authority required — authority is visible at the call site
+use cap_rand::{std_rng_from_os_rng, ambient_authority};
+let rng = std_rng_from_os_rng(ambient_authority());
+```
+
+---
+
+## Re-exported items
+
+`cap-rand` re-exports the following items from `rand` so you can use them without adding a separate `rand` dependency:
+
+```rust
+pub use rand::{
+    distr, rand_core, seq,
+    CryptoRng, Fill, Rng, RngCore, SeedableRng,
+    TryCryptoRng, TryRngCore,
+};
+```
+
+The `prelude` module re-exports the most commonly used items:
+
+```rust
+pub mod prelude {
+    pub use crate::distr::Distribution;
+    pub use crate::rngs::{CapRng, StdRng};
+    #[cfg(feature = "small_rng")]
+    pub use crate::rngs::SmallRng;
+    pub use crate::seq::{IteratorRandom, SliceRandom};
+    pub use crate::{random, thread_rng, CryptoRng, Rng, RngCore, SeedableRng};
+}
+```
+
+The `rngs` module additionally re-exports `rand::rngs::StdRng` and, with the `small_rng` feature, `rand::rngs::SmallRng`.
+
+---
+
+## Examples
+
+### Generating a random number
+
+```rust
+use cap_rand::{Rng, thread_rng, ambient_authority};
+
+let mut rng = thread_rng(ambient_authority());
+let n: u32 = rng.random();
+println!("random u32: {n}");
+```
+
+### Generating a value with a single call
+
+```rust
+use cap_rand::{random, ambient_authority};
+
+let x: f64 = random(ambient_authority());
+println!("random f64 in [0, 1): {x}");
+```
+
+### Using `OsRng` directly
+
+```rust
+use cap_rand::{rngs::OsRng, TryRngCore, ambient_authority};
+
+let mut rng = OsRng::default(ambient_authority());
+
+let mut key = [0u8; 32];
+rng.try_fill_bytes(&mut key).expect("OS RNG failed");
+println!("random key: {key:x?}");
+```
+
+### Seeding a `StdRng` for reproducible sequences
+
+```rust
+use cap_rand::{std_rng_from_os_rng, Rng, ambient_authority};
+
+// Seeded from OS entropy, but the seed can be saved for replay
+let mut rng = std_rng_from_os_rng(ambient_authority());
+
+let values: Vec<u32> = (0..10).map(|_| rng.random()).collect();
+println!("{values:?}");
+```
+
+### Passing RNG as a capability to sub-functions
+
+A key pattern in capability-based design is passing resources as parameters so sub-functions don't need ambient access:
+
+```rust
+use cap_rand::{rngs::CapRng, Rng};
+
+/// Generate n random bytes. Has no ambient entropy access — rng is passed in.
+fn random_bytes(rng: &mut CapRng, n: usize) -> Vec<u8> {
+    (0..n).map(|_| rng.random()).collect()
+}
+
+fn main() {
+    use cap_rand::{thread_rng, ambient_authority};
+    let mut rng = thread_rng(ambient_authority());
+    let bytes = random_bytes(&mut rng, 16);
+    println!("{bytes:x?}");
+}
+```
+
+### Using `SmallRng` (feature-gated)
+
+```rust
+// Cargo.toml: cap-rand = { version = "4.0.3", features = ["small_rng"] }
+
+use cap_rand::{rngs::{SmallRng, StdRng}, SeedableRng, Rng, std_rng_from_os_rng, ambient_authority};
+
+// Seed a fast, non-cryptographic SmallRng from the OS-seeded StdRng
+let mut seed_rng: StdRng = std_rng_from_os_rng(ambient_authority());
+let seed: u64 = seed_rng.random();
+let mut fast_rng = SmallRng::seed_from_u64(seed);
+
+println!("fast random: {}", fast_rng.random::<u32>());
+```
+
+<Tip>
+  `SmallRng` is not cryptographically secure. Use it for simulation, games, or
+  other non-security-sensitive uses where performance matters more than
+  unpredictability. For security-sensitive uses, keep using `OsRng` or
+  `CapRng`/`StdRng` seeded from the OS.
+</Tip>
+
+### Using distributions from `cap-rand`
+
+```rust
+use cap_rand::{thread_rng, distr::{Distribution, Uniform}, ambient_authority};
+
+let mut rng = thread_rng(ambient_authority());
+let die = Uniform::from(1..=6);
+
+let rolls: Vec<u32> = (0..5).map(|_| die.sample(&mut rng)).collect();
+println!("dice rolls: {rolls:?}");
+```

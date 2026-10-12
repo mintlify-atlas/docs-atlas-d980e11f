@@ -1,0 +1,175 @@
+---
+title: "UTF-8 Paths with cap_std::fs_utf8"
+sidebarTitle: "UTF-8 Paths"
+description: "Use cap_std::fs_utf8 to work with Utf8Path from camino instead of std::path::Path, ensuring all filesystem paths are valid UTF-8 strings."
+---
+
+On most modern systems, filesystem paths are valid UTF-8 in practice—but Rust's `std::path::Path` makes no such guarantee. On Unix, a path is an arbitrary sequence of bytes (excluding null); on Windows, it's an arbitrary sequence of 16-bit code units. This means that `Path::to_str()` can return `None` and methods like `Path::display()` may silently substitute replacement characters. For programs that treat paths as text (displaying them, serializing them to JSON or TOML, passing them to web APIs), this gap between "bytes" and "strings" is a constant source of boilerplate and potential bugs.
+
+`cap_std::fs_utf8` solves this by providing the same `Dir`-based API as `cap_std::fs`, but using [`camino::Utf8Path`](https://docs.rs/camino) in place of `std::path::Path`. Every path in and out of the API is guaranteed to be valid UTF-8—and the compiler enforces it.
+
+## Enabling `fs_utf8`
+
+Add cap-std to `Cargo.toml` with the `fs_utf8` feature:
+
+```toml
+[dependencies]
+cap-std = { version = "4", features = ["fs_utf8"] }
+```
+
+This enables the `cap_std::fs_utf8` module and adds `camino` as a dependency. cap-std re-exports `camino` from `cap_std::fs_utf8::camino` so you can depend on the same version without a separate entry in `Cargo.toml`:
+
+```rust
+use cap_std::fs_utf8::camino::{Utf8Path, Utf8PathBuf};
+```
+
+<Note>
+The minimum supported Rust version (MSRV) for cap-std with default features is **Rust 1.70**. The `fs_utf8` feature uses `camino`, which may have its own MSRV requirement. Check [`camino`'s changelog](https://docs.rs/camino) if you need to support older Rust versions.
+</Note>
+
+## Using `cap_std::fs_utf8`
+
+The `fs_utf8::Dir` API is identical to `fs::Dir`—it has the same methods with the same semantics—but all path parameters accept `&Utf8Path` (or anything that implements `AsRef<Utf8Path>`) instead of `&Path`.
+
+```rust
+use cap_std::ambient_authority;
+use cap_std::fs_utf8::Dir;
+
+fn main() -> std::io::Result<()> {
+    let dir = Dir::open_ambient_dir(".", ambient_authority())?;
+
+    // Path parameters are &str or &Utf8Path—always valid UTF-8.
+    dir.create_dir("output")?;
+    dir.write("output/result.txt", b"hello, world")?;
+
+    let text = dir.read_to_string("output/result.txt")?;
+    println!("{text}");
+
+    // read_dir yields DirEntry values whose file_name() returns Utf8OsStr.
+    for entry in dir.read_dir("output")? {
+        let entry = entry?;
+        println!("{}", entry.file_name()); // no .to_str().unwrap() needed
+    }
+
+    Ok(())
+}
+```
+
+Because `&str` implements `AsRef<Utf8Path>`, you can pass string literals directly without any conversion.
+
+## Migration: `fs` → `fs_utf8`
+
+The only changes needed to migrate from `cap_std::fs` to `cap_std::fs_utf8` are:
+
+1. Change the import from `cap_std::fs::Dir` to `cap_std::fs_utf8::Dir`.
+2. Change path types from `&Path` / `PathBuf` to `&Utf8Path` / `Utf8PathBuf`.
+
+<Tabs>
+  <Tab title="Before (cap_std::fs)">
+    ```rust
+    use cap_std::fs::Dir;
+    use std::path::{Path, PathBuf};
+
+    fn save_report(dir: &Dir, name: &Path, content: &str) -> std::io::Result<()> {
+        // Must handle the case where `name` is not valid UTF-8.
+        let display = name.display().to_string();
+        println!("Saving {display}");
+        dir.write(name, content.as_bytes())
+    }
+
+    fn list_reports(dir: &Dir) -> std::io::Result<Vec<PathBuf>> {
+        let mut names = Vec::new();
+        for entry in dir.read_dir("reports")? {
+            names.push(entry?.file_name().into());
+        }
+        Ok(names)
+    }
+    ```
+  </Tab>
+  <Tab title="After (cap_std::fs_utf8)">
+    ```rust
+    use cap_std::fs_utf8::Dir;
+    use cap_std::fs_utf8::camino::{Utf8Path, Utf8PathBuf};
+
+    fn save_report(dir: &Dir, name: &Utf8Path, content: &str) -> std::io::Result<()> {
+        // name is guaranteed UTF-8; use it directly as a string.
+        println!("Saving {name}");
+        dir.write(name, content.as_bytes())
+    }
+
+    fn list_reports(dir: &Dir) -> std::io::Result<Vec<Utf8PathBuf>> {
+        let mut names = Vec::new();
+        for entry in dir.read_dir("reports")? {
+            // file_name() returns a Utf8OsStr—no unwrap needed.
+            names.push(entry?.file_name().into());
+        }
+        Ok(names)
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## The `arf_strings` Feature: Lossless Encoding
+
+By default, `fs_utf8` requires that all paths on the host filesystem are valid UTF-8. On the rare platform where this is not the case, opening a file with a non-UTF-8 name will return an `InvalidData` error.
+
+The optional `arf_strings` feature provides a way around this: it uses the [ARF strings](https://github.com/bytecodealliance/arf-strings/) technique to losslessly encode arbitrary host byte sequences as valid UTF-8. This means you can represent any filename the OS supports as a `Utf8Path`, even if the underlying bytes are not valid UTF-8.
+
+<Warning>
+The `arf_strings` feature is **experimental**. The encoding scheme may change in future versions. Do not use it in production code that needs to store or exchange paths with other tools.
+</Warning>
+
+To enable it:
+
+```toml
+[dependencies]
+cap-std = { version = "4", features = ["arf_strings"] }
+```
+
+The `arf_strings` feature implies `fs_utf8`—you do not need to list both.
+
+### How ARF Strings Work
+
+ARF strings encode non-UTF-8 byte sequences using a special Unicode private-use escape sequence. The encoding is:
+
+- Valid UTF-8 bytes are passed through unchanged.
+- Invalid byte sequences are represented using U+F0000–U+FFFFF (Unicode Supplementary Private Use Area-A) code points.
+
+This means a path that is, say, valid Latin-1 but not valid UTF-8 can be round-tripped through a `Utf8PathBuf` without data loss. The encoded form is always valid Unicode; only tools that understand ARF strings can interpret the escape sequences.
+
+```rust
+// With the arf_strings feature enabled, this works even if the filesystem
+// contains non-UTF-8 filenames.
+use cap_std::fs_utf8::Dir;
+
+fn list_all(dir: &Dir) -> std::io::Result<()> {
+    for entry in dir.entries()? {
+        let entry = entry?;
+        // file_name() always returns a Utf8OsStr, even for non-UTF-8 names,
+        // because the raw bytes are encoded using ARF strings.
+        println!("{}", entry.file_name());
+    }
+    Ok(())
+}
+```
+
+### When to Use `arf_strings`
+
+| Situation | Recommendation |
+|---|---|
+| All paths in your system are UTF-8 (Linux/macOS/Windows with modern tooling) | Use `fs_utf8` without `arf_strings` |
+| You need to handle legacy filesystems or untrusted filenames that may not be UTF-8 | Enable `arf_strings` (experimental) |
+| You are targeting WASI | `fs_utf8` works; `arf_strings` support is in development |
+
+## `fs_utf8` vs `fs`: Choosing the Right Module
+
+| | `cap_std::fs` | `cap_std::fs_utf8` |
+|---|---|---|
+| Path type | `std::path::Path` | `camino::Utf8Path` |
+| Non-UTF-8 names | Supported | Error (or ARF-encoded with `arf_strings`) |
+| Cargo feature | *(default)* | `fs_utf8` |
+| Use paths as `&str` | Requires `.to_str().unwrap()` | Works directly |
+| Serialize paths to JSON/TOML | Requires conversion | Works directly |
+| MSRV | Rust 1.70 | Rust 1.70 (check camino's MSRV) |
+
+If you control all paths in your program and they will always be UTF-8 (the common case for modern applications), `fs_utf8` eliminates an entire class of conversion boilerplate and makes your path handling more ergonomic. If you need to handle arbitrary OS-level byte sequences—for example, when building a general-purpose file manager—stick with `cap_std::fs` and `std::path::Path`.

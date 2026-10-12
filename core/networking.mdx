@@ -1,0 +1,319 @@
+---
+title: "cap_std::net — Sandboxed Networking API"
+sidebarTitle: "Networking"
+description: "Reference for cap_std::net: the Pool type, TcpListener, TcpStream, UdpSocket, and capability-based address management in cap-std."
+---
+
+The `cap_std::net` module is a capability-based replacement for `std::net`. Rather than allowing any code to connect or bind to any network address, all TCP and UDP operations are gated through a [`Pool`](#pool) — a set of permitted addresses and ports. A `Pool` plays the same role for networking that [`Dir`](/core/filesystem) plays for the filesystem: it is a capability you receive, hold, and pass to the parts of your program that need network access. Code that is never handed a `Pool` cannot open any network connections.
+
+<Note>
+  The `cap_std::net` module is **disabled on WASI** (the entire `net` module is conditionally compiled out with `#[cfg(not(target_os = "wasi"))]`). Networking support on WASI is pending upstream support in the WASI standard.
+</Note>
+
+## Pool
+
+`Pool` is the central type in `cap_std::net`. It is a collection of network address rules — IP networks, port ranges, or specific socket addresses — that the holder is permitted to bind or connect to. Operations on `TcpListener`, `TcpStream`, and `UdpSocket` that name an address all go through a `Pool`, which checks the address against its rules before proceeding.
+
+`Pool` implements `Clone` and `Default`. Cloning a `Pool` creates a new independent pool with the same authority — be mindful that cloning does not restrict authority.
+
+```rust
+use cap_std::{ambient_authority, net::Pool};
+
+let mut pool = Pool::new();
+
+// Grant access to a specific host and port (requires ambient authority)
+pool.insert("example.com:443", ambient_authority())?;
+
+// Now connect using the pool
+let stream = pool.connect_tcp_stream("example.com:443")?;
+# Ok::<(), std::io::Error>(())
+```
+
+### Constructing a Pool
+
+#### `Pool::new`
+```rust
+pub fn new() -> Self
+```
+Constructs a new, empty pool that grants no network access.
+
+---
+
+### Inserting Addresses
+
+All `insert` methods require `AmbientAuthority` because they expand the pool's authority to reach the outside world. Collect these calls at your program's entry point or configuration boundary.
+
+#### `Pool::insert`
+```rust
+pub fn insert<A: ToSocketAddrs>(
+    &mut self,
+    addrs: A,
+    ambient_authority: AmbientAuthority,
+) -> io::Result<()>
+```
+Resolves `addrs` (anything that implements `ToSocketAddrs`, including `"host:port"` strings and `SocketAddr` values) and adds each resolved address to the pool.
+
+#### `Pool::insert_socket_addr`
+```rust
+pub fn insert_socket_addr(
+    &mut self,
+    addr: net::SocketAddr,
+    ambient_authority: AmbientAuthority,
+)
+```
+Adds a single, already-resolved [`SocketAddr`] to the pool.
+
+#### `Pool::insert_ip_net_port_any`
+```rust
+pub fn insert_ip_net_port_any(
+    &mut self,
+    ip_net: ipnet::IpNet,
+    ambient_authority: AmbientAuthority,
+)
+```
+Grants access to all ports on every address in the given IP network (CIDR range). Use this when you want to allow connections to an entire subnet without restricting the port.
+
+#### `Pool::insert_ip_net_port_range`
+```rust
+pub fn insert_ip_net_port_range(
+    &mut self,
+    ip_net: ipnet::IpNet,
+    ports_start: u16,
+    ports_end: Option<u16>,
+    ambient_authority: AmbientAuthority,
+)
+```
+Grants access to addresses in `ip_net` on ports in the range `[ports_start, ports_end)`. Pass `None` for `ports_end` to allow all ports from `ports_start` onwards.
+
+#### `Pool::insert_ip_net`
+```rust
+pub fn insert_ip_net(
+    &mut self,
+    ip_net: ipnet::IpNet,
+    port: u16,
+    ambient_authority: AmbientAuthority,
+)
+```
+Grants access to all addresses in the given IP network on a specific port.
+
+```rust
+use cap_std::{ambient_authority, net::Pool};
+use cap_std::ipnet::IpNet;
+use std::str::FromStr;
+
+let mut pool = Pool::new();
+let aa = ambient_authority();
+
+// Allow connecting to any address in 192.168.1.0/24 on port 8080
+let local_net: IpNet = "192.168.1.0/24".parse().unwrap();
+pool.insert_ip_net(local_net, 8080, aa);
+
+// Allow connecting to a specific address on any port
+pool.insert_socket_addr("10.0.0.1:443".parse().unwrap(), aa);
+```
+
+---
+
+### TCP Operations via Pool
+
+#### `Pool::bind_tcp_listener`
+```rust
+pub fn bind_tcp_listener<A: ToSocketAddrs>(&self, addr: A) -> io::Result<TcpListener>
+```
+Creates a new `TcpListener` bound to `addr`, after verifying that the address is permitted by the pool. Corresponds to `std::net::TcpListener::bind`.
+
+#### `Pool::connect_tcp_stream`
+```rust
+pub fn connect_tcp_stream<A: ToSocketAddrs>(&self, addr: A) -> io::Result<TcpStream>
+```
+Opens a TCP connection to `addr`, after verifying that the address is permitted by the pool. Corresponds to `std::net::TcpStream::connect`.
+
+#### `Pool::connect_timeout_tcp_stream`
+```rust
+pub fn connect_timeout_tcp_stream(
+    &self,
+    addr: &SocketAddr,
+    timeout: Duration,
+) -> io::Result<TcpStream>
+```
+Like `connect_tcp_stream`, but with a connection timeout. Corresponds to `std::net::TcpStream::connect_timeout`.
+
+---
+
+### UDP Operations via Pool
+
+#### `Pool::bind_udp_socket`
+```rust
+pub fn bind_udp_socket<A: ToSocketAddrs>(&self, addr: A) -> io::Result<UdpSocket>
+```
+Creates a `UdpSocket` bound to `addr`, after verifying the address is in the pool. Corresponds to `std::net::UdpSocket::bind`.
+
+#### `Pool::connect_udp_socket`
+```rust
+pub fn connect_udp_socket<A: ToSocketAddrs>(
+    &self,
+    udp_socket: &UdpSocket,
+    addr: A,
+) -> io::Result<()>
+```
+Associates `udp_socket` with the remote address `addr` (enabling `send`/`recv`), after verifying the address is permitted. Corresponds to `std::net::UdpSocket::connect`.
+
+#### `Pool::send_to_udp_socket_addr`
+```rust
+pub fn send_to_udp_socket_addr<A: ToSocketAddrs>(
+    &self,
+    udp_socket: &UdpSocket,
+    buf: &[u8],
+    addr: A,
+) -> io::Result<usize>
+```
+Sends `buf` on `udp_socket` to `addr`, after verifying the destination is in the pool. Corresponds to `std::net::UdpSocket::send_to`.
+
+---
+
+## TcpListener
+
+`cap_std::net::TcpListener` wraps `std::net::TcpListener`. It has no `bind` constructor — use [`Pool::bind_tcp_listener`](#poolbind_tcp_listener) instead.
+
+```rust
+let mut pool = Pool::new();
+pool.insert("127.0.0.1:8080", ambient_authority())?;
+
+let listener = pool.bind_tcp_listener("127.0.0.1:8080")?;
+println!("Listening on {}", listener.local_addr()?);
+
+for stream in listener.incoming() {
+    let (mut stream, peer) = listener.accept()?;
+    println!("Connection from {peer}");
+    // handle stream ...
+}
+# Ok::<(), std::io::Error>(())
+```
+
+| Method | Corresponds to |
+|--------|---------------|
+| `listener.local_addr()` | `TcpListener::local_addr` |
+| `listener.try_clone()` | `TcpListener::try_clone` |
+| `listener.accept()` | `TcpListener::accept` → `(TcpStream, SocketAddr)` |
+| `listener.incoming()` | `TcpListener::incoming` → `Incoming` iterator |
+| `listener.set_ttl(ttl)` | `TcpListener::set_ttl` |
+| `listener.ttl()` | `TcpListener::ttl` |
+| `listener.take_error()` | `TcpListener::take_error` |
+| `listener.set_nonblocking(b)` | `TcpListener::set_nonblocking` |
+
+---
+
+## TcpStream
+
+`cap_std::net::TcpStream` wraps `std::net::TcpStream` and implements `Read` and `Write`. It has no `connect` constructor — use [`Pool::connect_tcp_stream`](#poolconnect_tcp_stream) instead.
+
+```rust
+use std::io::Write;
+
+let stream = pool.connect_tcp_stream("example.com:80")?;
+let mut stream = stream;
+stream.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")?;
+# Ok::<(), std::io::Error>(())
+```
+
+| Method | Corresponds to |
+|--------|---------------|
+| `stream.peer_addr()` | `TcpStream::peer_addr` |
+| `stream.local_addr()` | `TcpStream::local_addr` |
+| `stream.shutdown(how)` | `TcpStream::shutdown` |
+| `stream.try_clone()` | `TcpStream::try_clone` |
+| `stream.set_read_timeout(dur)` | `TcpStream::set_read_timeout` |
+| `stream.set_write_timeout(dur)` | `TcpStream::set_write_timeout` |
+| `stream.read_timeout()` | `TcpStream::read_timeout` |
+| `stream.write_timeout()` | `TcpStream::write_timeout` |
+| `stream.peek(buf)` | `TcpStream::peek` |
+| `stream.set_nodelay(b)` | `TcpStream::set_nodelay` |
+| `stream.nodelay()` | `TcpStream::nodelay` |
+| `stream.set_ttl(ttl)` | `TcpStream::set_ttl` |
+| `stream.ttl()` | `TcpStream::ttl` |
+| `stream.take_error()` | `TcpStream::take_error` |
+| `stream.set_nonblocking(b)` | `TcpStream::set_nonblocking` |
+
+---
+
+## UdpSocket
+
+`cap_std::net::UdpSocket` wraps `std::net::UdpSocket`. It has no `bind`, `connect`, or `send_to` constructors — use the corresponding [`Pool`](#pool) methods instead.
+
+```rust
+let socket = pool.bind_udp_socket("0.0.0.0:0")?;
+pool.connect_udp_socket(&socket, "8.8.8.8:53")?;
+socket.send(b"\x00\x01...")?; // send a DNS query
+# Ok::<(), std::io::Error>(())
+```
+
+Key methods on `UdpSocket` (those that don't involve naming a new address):
+
+| Method | Corresponds to |
+|--------|---------------|
+| `socket.recv_from(buf)` | `UdpSocket::recv_from` |
+| `socket.peek_from(buf)` | `UdpSocket::peek_from` |
+| `socket.send(buf)` | `UdpSocket::send` (after `connect`) |
+| `socket.recv(buf)` | `UdpSocket::recv` (after `connect`) |
+| `socket.peek(buf)` | `UdpSocket::peek` (after `connect`) |
+| `socket.local_addr()` | `UdpSocket::local_addr` |
+| `socket.peer_addr()` | `UdpSocket::peer_addr` |
+| `socket.try_clone()` | `UdpSocket::try_clone` |
+| `socket.set_broadcast(b)` | `UdpSocket::set_broadcast` |
+| `socket.broadcast()` | `UdpSocket::broadcast` |
+| `socket.set_multicast_loop_v4(b)` | `UdpSocket::set_multicast_loop_v4` |
+| `socket.join_multicast_v4(addr, iface)` | `UdpSocket::join_multicast_v4` |
+| `socket.join_multicast_v6(addr, iface)` | `UdpSocket::join_multicast_v6` |
+| `socket.set_ttl(ttl)` | `UdpSocket::set_ttl` |
+| `socket.set_nonblocking(b)` | `UdpSocket::set_nonblocking` |
+
+---
+
+## Re-exported standard types
+
+The following types are re-exported from `std::net` unchanged and can be used as-is:
+
+| Type | Description |
+|------|-------------|
+| `SocketAddr` | Either a `SocketAddrV4` or `SocketAddrV6` |
+| `SocketAddrV4` | IPv4 socket address |
+| `SocketAddrV6` | IPv6 socket address |
+| `IpAddr` | An IP address (v4 or v6) |
+| `Ipv4Addr` | An IPv4 address |
+| `Ipv6Addr` | An IPv6 address |
+| `Shutdown` | How to shut down a connection |
+| `AddrParseError` | Error parsing a socket address |
+| `ToSocketAddrs` | Trait for address resolution |
+
+---
+
+## Complete example: HTTP server
+
+```rust
+use cap_std::{ambient_authority, net::Pool};
+use std::io::{Read, Write};
+
+fn main() -> std::io::Result<()> {
+    let mut pool = Pool::new();
+    pool.insert("127.0.0.1:8080", ambient_authority())?;
+
+    let listener = pool.bind_tcp_listener("127.0.0.1:8080")?;
+    println!("Serving at http://127.0.0.1:8080/");
+
+    loop {
+        let (mut stream, peer_addr) = listener.accept()?;
+        println!("Connection from {peer_addr}");
+
+        let mut request = vec![0u8; 1024];
+        let n = stream.read(&mut request)?;
+        println!("Received {} bytes", n);
+
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
+        stream.write_all(response)?;
+    }
+}
+```
+
+<Tip>
+  For advanced networking features — such as creating a capability object that can only bind (not connect), or only connect to specific addresses — see the [`cap-net-ext`](https://docs.rs/cap-net-ext) crate. It extends `Pool` with `PoolExt`, providing "binder" and "connecter" objects that carry a narrower slice of the pool's authority.
+</Tip>
