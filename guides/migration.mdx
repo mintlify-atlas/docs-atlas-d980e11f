@@ -1,5 +1,5 @@
 ---
-title: "Migrating from std::fs to cap-std"
+title: "Migrating from std::fs and std::net to cap-std APIs"
 sidebarTitle: "Migration"
 description: "Step-by-step guide to replacing std::fs and std::net calls with their cap-std equivalents for capability-based filesystem and network access."
 ---
@@ -243,10 +243,10 @@ Every cap-std program needs to acquire its initial `Dir` at the entry point. The
     ```rust
     use cap_std::fs::{Dir, OpenOptions};
 
-    // OpenOptions is constructed the same way; pass it to `dir.open_with`.
+    // OpenOptions is constructed the same way; pass a reference to `dir.open_with`.
     let file = dir.open_with(
         "data/log.txt",
-        OpenOptions::new().read(true).write(true).create(true),
+        &OpenOptions::new().read(true).write(true).create(true),
     )?;
     ```
   </Tab>

@@ -68,7 +68,7 @@ impl CapRng {
 
 ```rust
 /// Returns a lazily-initialized thread-local PRNG seeded by the OS.
-/// Corresponds to rand::rng().
+/// Corresponds to rand::rng() (previously rand::thread_rng() in rand 0.8).
 ///
 /// # Ambient Authority
 pub fn thread_rng(ambient_authority: AmbientAuthority) -> CapRng;
@@ -93,17 +93,17 @@ pub fn std_rng_from_os_rng(ambient_authority: AmbientAuthority) -> StdRng;
 /// # Ambient Authority
 pub fn random<T>(ambient_authority: AmbientAuthority) -> T
 where
-    StandardUniform: Distribution<T>;
+    distr::StandardUniform: distr::Distribution<T>;
 ```
 
 ---
 
-## Why use `std_rng_from_os_rng` instead of `SeedableRng::from_entropy`?
+## Why use `std_rng_from_os_rng` instead of `SeedableRng::from_os_rng`?
 
-The `rand::SeedableRng` trait includes a `from_entropy()` method that reads directly from the OS entropy source without any explicit authority token. Although `cap-rand` re-exports `SeedableRng`, calling `SeedableRng::from_entropy()` on types that implement it (like `StdRng`) bypasses the capability model.
+The `rand::SeedableRng` trait includes a `from_os_rng()` method that reads directly from the OS entropy source without any explicit authority token. Although `cap-rand` re-exports `SeedableRng`, calling `SeedableRng::from_os_rng()` on types that implement it (like `StdRng`) bypasses the capability model.
 
 <Warning>
-  Do **not** call `rand::SeedableRng::from_entropy()` on `StdRng` or any other
+  Do **not** call `rand::SeedableRng::from_os_rng()` on `StdRng` or any other
   type in a capability-safe program. Use `cap_rand::std_rng_from_os_rng(ambient_authority())`
   instead, which requires an explicit authority token and is easy to audit.
 </Warning>
@@ -111,7 +111,7 @@ The `rand::SeedableRng` trait includes a `from_entropy()` method that reads dire
 ```rust
 // ❌ Bypasses capability model — ambient entropy access, invisible to auditors
 use rand::SeedableRng;
-let rng = rand::rngs::StdRng::from_entropy();
+let rng = rand::rngs::StdRng::from_os_rng();
 
 // ✅ Explicit ambient authority required — authority is visible at the call site
 use cap_rand::{std_rng_from_os_rng, ambient_authority};

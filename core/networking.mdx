@@ -51,7 +51,7 @@ pub fn insert<A: ToSocketAddrs>(
     ambient_authority: AmbientAuthority,
 ) -> io::Result<()>
 ```
-Resolves `addrs` (anything that implements `ToSocketAddrs`, including `"host:port"` strings and `SocketAddr` values) and adds each resolved address to the pool.
+Resolves `addrs` (anything that implements `ToSocketAddrs`, including `"host:port"` strings and `SocketAddr` values) and adds each resolved address to the pool. Returns `io::Result<()>` because DNS resolution may fail.
 
 #### `Pool::insert_socket_addr`
 ```rust
@@ -61,7 +61,7 @@ pub fn insert_socket_addr(
     ambient_authority: AmbientAuthority,
 )
 ```
-Adds a single, already-resolved [`SocketAddr`] to the pool.
+Adds a single, already-resolved [`SocketAddr`] to the pool. Returns `()` — no I/O is performed.
 
 #### `Pool::insert_ip_net_port_any`
 ```rust
@@ -71,7 +71,7 @@ pub fn insert_ip_net_port_any(
     ambient_authority: AmbientAuthority,
 )
 ```
-Grants access to all ports on every address in the given IP network (CIDR range). Use this when you want to allow connections to an entire subnet without restricting the port.
+Grants access to all ports on every address in the given IP network (CIDR range). Use this when you want to allow connections to an entire subnet without restricting the port. Returns `()`.
 
 #### `Pool::insert_ip_net_port_range`
 ```rust
@@ -83,7 +83,7 @@ pub fn insert_ip_net_port_range(
     ambient_authority: AmbientAuthority,
 )
 ```
-Grants access to addresses in `ip_net` on ports in the range `[ports_start, ports_end)`. Pass `None` for `ports_end` to allow all ports from `ports_start` onwards.
+Grants access to addresses in `ip_net` on ports in the range `[ports_start, ports_end)`. Pass `None` for `ports_end` to allow all ports from `ports_start` onwards. Returns `()`.
 
 #### `Pool::insert_ip_net`
 ```rust
@@ -94,12 +94,11 @@ pub fn insert_ip_net(
     ambient_authority: AmbientAuthority,
 )
 ```
-Grants access to all addresses in the given IP network on a specific port.
+Grants access to all addresses in the given IP network on a specific port. Returns `()`.
 
 ```rust
 use cap_std::{ambient_authority, net::Pool};
 use cap_std::ipnet::IpNet;
-use std::str::FromStr;
 
 let mut pool = Pool::new();
 let aa = ambient_authority();
@@ -182,7 +181,7 @@ pool.insert("127.0.0.1:8080", ambient_authority())?;
 let listener = pool.bind_tcp_listener("127.0.0.1:8080")?;
 println!("Listening on {}", listener.local_addr()?);
 
-for stream in listener.incoming() {
+loop {
     let (mut stream, peer) = listener.accept()?;
     println!("Connection from {peer}");
     // handle stream ...
@@ -210,8 +209,7 @@ for stream in listener.incoming() {
 ```rust
 use std::io::Write;
 
-let stream = pool.connect_tcp_stream("example.com:80")?;
-let mut stream = stream;
+let mut stream = pool.connect_tcp_stream("example.com:80")?;
 stream.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")?;
 # Ok::<(), std::io::Error>(())
 ```
@@ -259,12 +257,25 @@ Key methods on `UdpSocket` (those that don't involve naming a new address):
 | `socket.local_addr()` | `UdpSocket::local_addr` |
 | `socket.peer_addr()` | `UdpSocket::peer_addr` |
 | `socket.try_clone()` | `UdpSocket::try_clone` |
+| `socket.set_read_timeout(dur)` | `UdpSocket::set_read_timeout` |
+| `socket.set_write_timeout(dur)` | `UdpSocket::set_write_timeout` |
+| `socket.read_timeout()` | `UdpSocket::read_timeout` |
+| `socket.write_timeout()` | `UdpSocket::write_timeout` |
 | `socket.set_broadcast(b)` | `UdpSocket::set_broadcast` |
 | `socket.broadcast()` | `UdpSocket::broadcast` |
 | `socket.set_multicast_loop_v4(b)` | `UdpSocket::set_multicast_loop_v4` |
+| `socket.multicast_loop_v4()` | `UdpSocket::multicast_loop_v4` |
+| `socket.set_multicast_ttl_v4(ttl)` | `UdpSocket::set_multicast_ttl_v4` |
+| `socket.multicast_ttl_v4()` | `UdpSocket::multicast_ttl_v4` |
+| `socket.set_multicast_loop_v6(b)` | `UdpSocket::set_multicast_loop_v6` |
+| `socket.multicast_loop_v6()` | `UdpSocket::multicast_loop_v6` |
 | `socket.join_multicast_v4(addr, iface)` | `UdpSocket::join_multicast_v4` |
+| `socket.leave_multicast_v4(addr, iface)` | `UdpSocket::leave_multicast_v4` |
 | `socket.join_multicast_v6(addr, iface)` | `UdpSocket::join_multicast_v6` |
+| `socket.leave_multicast_v6(addr, iface)` | `UdpSocket::leave_multicast_v6` |
 | `socket.set_ttl(ttl)` | `UdpSocket::set_ttl` |
+| `socket.ttl()` | `UdpSocket::ttl` |
+| `socket.take_error()` | `UdpSocket::take_error` |
 | `socket.set_nonblocking(b)` | `UdpSocket::set_nonblocking` |
 
 ---

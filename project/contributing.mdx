@@ -1,5 +1,5 @@
 ---
-title: "Contributing to cap-std"
+title: "Contributing to cap-std: Setup, Tests, and Pull Requests"
 sidebarTitle: "Contributing"
 description: "How to contribute to cap-std: development setup, running tests, fuzzing, benchmarking, code of conduct, and the Bytecode Alliance membership context."
 ---
@@ -77,9 +77,20 @@ cargo test --no-default-features --features=fs_utf8 --workspace
 
 cap-std includes a fuzzing harness for the `cap-primitives` crate. The fuzzer constructs random paths and attempts random filesystem operations on them, checking that the sandbox invariants hold under all circumstances.
 
+First, install the required tooling:
+
 ```bash
-# From the fuzz/ directory
-cargo fuzz run fuzz_target_1
+# Install cargo-fuzz
+cargo install cargo-fuzz
+
+# Install the nightly toolchain (required by cargo-fuzz)
+rustup toolchain add nightly
+```
+
+Then run the fuzzer from the repository root:
+
+```bash
+env 'RUSTFLAGS=--cfg racy_asserts' cargo +nightly fuzz run cap-primitives
 ```
 
 <Warning>

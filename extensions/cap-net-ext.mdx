@@ -166,10 +166,20 @@ impl TcpBinder {
     pub fn bind_existing_tcp_listener(&self, listener: &TcpListener) -> io::Result<()>;
 }
 
+pub struct UdpBinder { /* ... */ }
+impl UdpBinder {
+    pub fn bind_existing_udp_socket(&self, socket: &UdpSocket) -> io::Result<()>;
+}
+
 pub struct TcpConnecter { /* ... */ }
 impl TcpConnecter {
     pub fn connect_into_tcp_stream(&self, socket: TcpListener) -> io::Result<TcpStream>;
     pub fn connect_existing_tcp_listener(&self, socket: &TcpListener) -> io::Result<()>;
+}
+
+pub struct UdpConnecter { /* ... */ }
+impl UdpConnecter {
+    pub fn connect_existing_udp_socket(&self, socket: &UdpSocket) -> io::Result<()>;
 }
 ```
 

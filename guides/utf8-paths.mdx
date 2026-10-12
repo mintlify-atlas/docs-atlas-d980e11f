@@ -1,5 +1,5 @@
 ---
-title: "UTF-8 Paths with cap_std::fs_utf8"
+title: "Guaranteed UTF-8 Filesystem Paths with cap_std::fs_utf8"
 sidebarTitle: "UTF-8 Paths"
 description: "Use cap_std::fs_utf8 to work with Utf8Path from camino instead of std::path::Path, ensuring all filesystem paths are valid UTF-8 strings."
 ---
@@ -45,10 +45,10 @@ fn main() -> std::io::Result<()> {
     let text = dir.read_to_string("output/result.txt")?;
     println!("{text}");
 
-    // read_dir yields DirEntry values whose file_name() returns Utf8OsStr.
+    // read_dir yields DirEntry values whose file_name() returns io::Result<String>.
     for entry in dir.read_dir("output")? {
         let entry = entry?;
-        println!("{}", entry.file_name()); // no .to_str().unwrap() needed
+        println!("{}", entry.file_name()?); // returns Result<String>, so ? to unwrap
     }
 
     Ok(())
@@ -100,8 +100,8 @@ The only changes needed to migrate from `cap_std::fs` to `cap_std::fs_utf8` are:
     fn list_reports(dir: &Dir) -> std::io::Result<Vec<Utf8PathBuf>> {
         let mut names = Vec::new();
         for entry in dir.read_dir("reports")? {
-            // file_name() returns a Utf8OsStr—no unwrap needed.
-            names.push(entry?.file_name().into());
+            // file_name() returns io::Result<String>—use ? to propagate errors.
+            names.push(entry?.file_name()?.into());
         }
         Ok(names)
     }
@@ -145,9 +145,9 @@ use cap_std::fs_utf8::Dir;
 fn list_all(dir: &Dir) -> std::io::Result<()> {
     for entry in dir.entries()? {
         let entry = entry?;
-        // file_name() always returns a Utf8OsStr, even for non-UTF-8 names,
-        // because the raw bytes are encoded using ARF strings.
-        println!("{}", entry.file_name());
+        // file_name() returns io::Result<String>. With arf_strings enabled,
+        // non-UTF-8 bytes are losslessly encoded, so it always succeeds.
+        println!("{}", entry.file_name()?);
     }
     Ok(())
 }

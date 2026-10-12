@@ -304,7 +304,7 @@ Creates a hard link from `src` (relative to `self`) to `dst` (relative to `dst_d
 
 ### Symbolic Links
 
-#### `Dir::symlink` *(Unix only)*
+#### `Dir::symlink` *(non-Windows)*
 ```rust
 pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
     &self,
@@ -313,6 +313,16 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
 ) -> io::Result<()>
 ```
 Creates a symlink named `link` (relative to `self`) whose target is `original`. Returns an error if `original` is an absolute path. On Unix, corresponds to `std::os::unix::fs::symlink`.
+
+#### `Dir::symlink_contents` *(non-Windows)*
+```rust
+pub fn symlink_contents<P: AsRef<Path>, Q: AsRef<Path>>(
+    &self,
+    original: P,
+    link: Q,
+) -> io::Result<()>
+```
+Like `symlink`, but does **not** reject absolute paths in `original`. Use this when you need to create a symlink whose target is an absolute path and you have verified that it is safe to do so.
 
 #### `Dir::symlink_file` *(Windows only)*
 ```rust
@@ -339,6 +349,12 @@ Creates a directory symbolic link on Windows. Corresponds to `std::os::windows::
 pub fn read_link<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf>
 ```
 Reads a symbolic link, returning the path it points to. Returns an error if the target is an absolute path. Corresponds to `std::fs::read_link`.
+
+#### `Dir::read_link_contents`
+```rust
+pub fn read_link_contents<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf>
+```
+Like `read_link`, but does **not** return an error if the symlink target is an absolute path. Use this when you need the raw symlink target regardless of whether it is absolute or relative.
 
 #### `Dir::canonicalize`
 ```rust
@@ -384,7 +400,7 @@ Removes the directory represented by `self` and all its contents, then consumes 
 
 ### Unix Domain Sockets *(Unix only, not yet implemented)*
 
-`Dir` declares `bind_unix_listener`, `connect_unix_stream`, `bind_unix_datagram`, and `connect_unix_datagram` methods for working with Unix domain sockets at paths relative to the directory. These are declared in the API for forward-compatibility but currently panic with `todo!()`. Track [the upstream issue](https://github.com/bytecodealliance/cap-std) for implementation status.
+`Dir` declares `bind_unix_listener`, `connect_unix_stream`, `bind_unix_datagram`, `connect_unix_datagram`, and `send_to_unix_datagram_addr` methods for working with Unix domain sockets at paths relative to the directory. These are declared in the API for forward-compatibility but currently panic with `todo!()`. Track [the upstream issue](https://github.com/bytecodealliance/cap-std) for implementation status.
 
 ---
 
@@ -484,7 +500,7 @@ These types are re-exported directly from `cap_primitives` and match the `std` A
 use cap_std::{ambient_authority, fs::Dir};
 use std::io;
 
-fn process_uploads(uploads: &Dir) -> io::Result<()> {
+fn process_uploads(uploads: &Dir, archive: &Dir) -> io::Result<()> {
     for entry in uploads.entries()? {
         let entry = entry?;
         let name = entry.file_name();
@@ -493,8 +509,8 @@ fn process_uploads(uploads: &Dir) -> io::Result<()> {
             let data = uploads.read(&name)?;
             println!("Processing {:?}: {} bytes", name, data.len());
 
-            // Move processed files into an archive subdirectory
-            uploads.rename(&name, uploads, &name)?;
+            // Move processed files into the archive subdirectory
+            uploads.rename(&name, archive, &name)?;
         }
     }
     Ok(())
@@ -506,7 +522,8 @@ fn main() -> io::Result<()> {
     base.create_dir_all("archive")?;
 
     let uploads = base.open_dir("uploads")?;
-    process_uploads(&uploads)?;
+    let archive = base.open_dir("archive")?;
+    process_uploads(&uploads, &archive)?;
     Ok(())
 }
 ```

@@ -1,7 +1,7 @@
 ---
-title: "Platform Support and Performance in cap-std"
+title: "cap-std Platform Support: Linux, FreeBSD, macOS, Windows"
 sidebarTitle: "Platform Support"
-description: "cap-std supports Linux, macOS, FreeBSD, and Windows, with optimized single-syscall Dir::open on Linux 5.6+ and FreeBSD 13.0+."
+description: "cap-std supports Linux, macOS, FreeBSD, and Windows. Get optimized single-syscall Dir::open on Linux 5.6+ via openat2 and FreeBSD 13.0+."
 ---
 
 cap-std provides a consistent capability-based filesystem API across all major platforms. Wherever possible, it delegates to native OS primitives to enforce sandboxing efficiently in a single system call. Where those primitives are unavailable, it falls back to a careful, component-by-component path traversal algorithm that maintains the same security guarantees without sacrificing correctness.

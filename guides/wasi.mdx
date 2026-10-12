@@ -1,5 +1,5 @@
 ---
-title: "cap-std on WASI: WebAssembly System Interface"
+title: "Using cap-std on WASI: WebAssembly System Interface"
 sidebarTitle: "WASI"
 description: "How cap-std's capability-based API aligns with WASI's sandboxing model, its role in Wasmtime, and what to expect when targeting wasm32-wasi."
 ---
@@ -44,24 +44,21 @@ WASI:     [cap-std] → [WASI syscalls (already capability-scoped)]
 
 This means cap-std on WASI is both simpler and more efficient than on native platforms: there's less code between your application and the underlying capability boundary.
 
-## The `wasi_ext` Feature
+## WASI-Specific Filesystem Extensions
+
+cap-std uses the Rust nightly `wasi_ext` feature gate internally when compiling for `wasm32-wasi`. This is handled automatically by the crate's `lib.rs` — no extra Cargo feature flag is required in your `Cargo.toml`.
+
+WASI-specific `OpenOptions` extensions are exposed through `cap_std::fs::OpenOptionsExt`, which is re-exported from `cap_primitives`. When targeting `wasm32-wasi`, this trait gains additional methods corresponding to WASI's `oflags` and `fs_rights` fields in `path_open`, providing access to capabilities not expressible through the standard `OpenOptions` API.
 
 <Note>
-The `wasi_ext` feature enables WASI-specific filesystem extensions available through `cap_std::os::wasi::fs::OpenOptionsExt`. These correspond to WASI's `oflags` and `fs_rights` fields in `path_open`, providing access to capabilities not expressible through the standard `OpenOptions` API.
+The `wasi_ext` compiler feature is enabled automatically inside cap-std via `#![cfg_attr(target_os = "wasi", feature(wasi_ext))]`. You do not need to add any feature flag to your `Cargo.toml` to use WASI filesystem extensions; they are available whenever you compile for `wasm32-wasi` with a nightly toolchain.
 </Note>
 
-To use WASI filesystem extensions in your cap-std code:
-
-```toml
-[dependencies]
-cap-std = "4"
-```
-
-Then, inside a `#[cfg(target_os = "wasi")]` block:
+To use WASI filesystem extensions in your cap-std code, guard the import with `#[cfg(target_os = "wasi")]`:
 
 ```rust
 #[cfg(target_os = "wasi")]
-use cap_std::os::wasi::fs::OpenOptionsExt;
+use cap_std::fs::OpenOptionsExt;
 
 fn open_with_wasi_flags(dir: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::File> {
     #[cfg(target_os = "wasi")]
@@ -69,7 +66,7 @@ fn open_with_wasi_flags(dir: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::
         use cap_std::fs::OpenOptions;
         dir.open_with(
             "data.bin",
-            OpenOptions::new().read(true).write(true),
+            &OpenOptions::new().read(true).write(true),
         )
     }
     #[cfg(not(target_os = "wasi"))]
